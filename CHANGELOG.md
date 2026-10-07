@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional **Keep tablet charging from Mac** recovery in USB mode. The Mac host binds the tablet selected when enabled, corrects outgoing USB power once per attachment, and verifies incoming power. Recovery stays active when streaming stops, but requires the Mac app to remain open. Unsafe or unsupported states are reported without repeated power-switch attempts.
 - Stream-scoped tablet refresh requests and optional native-resolution decoder negotiation checked at 120 FPS, using the same eligible ordinary hardware decoder profile for capability limits and playback. Add numeric capture/encoder stage counters and retain six capture buffers above 60 Hz after the measured comparison; sustained 120 FPS depends on hardware and workload.
 
+### Known issue — "Screen & System Audio: Required" after updating (#77, #8, #5)
+The Mac app is ad-hoc signed, so every release has a new code hash. macOS ties the Screen Recording grant to that hash: after an update the toggle in System Settings still shows SideScreen as on, but the app sees the permission as missing, the Status row stays red and Start is disabled. Removing and re-adding the entry in System Settings often does not clear it. Fix, in Terminal:
+
+```
+tccutil reset ScreenCapture com.sidescreen.app
+```
+
+Then open SideScreen and grant Screen & System Audio Recording again when macOS asks. The app does not run this itself on purpose: doing so in 0.7.0 made XProtect quarantine the binary. A permanent fix (a stable signing identity) is planned.
+
 ### Planned
 - mDNS auto-discovery for wireless mode
 - Audio streaming
@@ -30,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 <a id="0.11.3"></a>
-## [0.11.3] - 2026-09-05
+## [0.11.3] - 2026-09-07
 
 Picture-quality and black-screen release. Colours no longer wash out on tablets that ignore the stream's full-range flag (#55), the stream is bounded by what the tablet's decoder can actually sustain rather than the size it claims (#66, #41), the decoder is always configured for the frame it really receives under HiDPI, and the Mac host now waits for its TCP listener before calling itself started. Thanks to @meta-boy and @cwy433-png for the contributions.
 
@@ -49,6 +58,7 @@ Picture-quality and black-screen release. Colours no longer wash out on tablets 
 - **macOS (Homebrew)**: `brew tap tranvuongquocdat/sidescreen && brew install --cask --no-quarantine sidescreen` (or `brew upgrade --cask sidescreen`). Requires macOS 13 (Ventura) or later.
 - **macOS (manual)**: Open `SideScreen-0.11.3-mac-universal.dmg`, drag SideScreen to Applications. If Gatekeeper says "damaged"/"cannot be opened": `sudo xattr -cr /Applications/SideScreen.app`. Requires macOS 13 (Ventura) or later.
 - **Android**: Install `SideScreen-0.11.3-android.apk` (enable "Unknown sources" if needed).
+- **Updating from an earlier version**: if the app reports Screen & System Audio as "Required" even though System Settings shows it on, run `tccutil reset ScreenCapture com.sidescreen.app` in Terminal and grant again (see Known issue above).
 
 ---
 
