@@ -428,7 +428,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindow = SettingsWindowController(settings: settings)
 
         settings.onToggleServer = { [weak self] in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 if self.settings.isRunning {
                     self.stopServer()

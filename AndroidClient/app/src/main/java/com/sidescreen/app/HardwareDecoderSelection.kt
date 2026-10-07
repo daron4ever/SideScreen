@@ -48,8 +48,7 @@ internal class HardwareDecoderSelection(
             selections[key]
         }
 
-    fun nominalMaxDecodeSize(mime: String): Pair<Int, Int>? =
-        selectedDecoder(mime)?.let { it.maxWidth to it.maxHeight }
+    fun nominalMaxDecodeSize(mime: String): Pair<Int, Int>? = selectedDecoder(mime)?.let { it.maxWidth to it.maxHeight }
 
     fun maxStreamSize(
         mime: String,

@@ -50,7 +50,10 @@ object CodecCapabilities {
         return lowerName.startsWith("c2.android.") || lowerName.startsWith("omx.google.")
     }
 
-    internal fun isBrokenHevcDecoder(name: String, mime: String): Boolean =
+    internal fun isBrokenHevcDecoder(
+        name: String,
+        mime: String,
+    ): Boolean =
         mime.equals(MediaFormat.MIMETYPE_VIDEO_HEVC, ignoreCase = true) &&
             BROKEN_HEVC_HW_PREFIXES.any { name.lowercase().startsWith(it) }
 

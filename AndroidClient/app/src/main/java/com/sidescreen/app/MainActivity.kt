@@ -52,6 +52,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: PreferencesManager
     private var videoDecoder: VideoDecoder? = null
+
     @Volatile private var streamClient: StreamClient? = null
 
     /** In-flight code-pairing attempt (issue #35); cancelled when its dialog closes. */
@@ -1052,7 +1053,9 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 if (streamClient !== client || isDestroyed ||
                     (connected && !displaySleepPolicy.isCurrentAttempt(refreshAttempt))
-                ) return@runOnUiThread
+                ) {
+                    return@runOnUiThread
+                }
                 updateRefreshConnection(refreshAttempt, connected)
                 displaySleepPolicy.updateConnection(refreshAttempt, connected)
                 updateDisplaySleepPolicy()
@@ -1591,7 +1594,11 @@ class MainActivity : AppCompatActivity() {
         val mode = display?.mode
         val rates =
             display?.supportedModes
-                ?.filter { mode != null && it.physicalWidth == mode.physicalWidth && it.physicalHeight == mode.physicalHeight }
+                ?.filter {
+                    mode != null &&
+                        it.physicalWidth == mode.physicalWidth &&
+                        it.physicalHeight == mode.physicalHeight
+                }
                 ?.map { it.refreshRate }
                 .orEmpty()
         val requested =
