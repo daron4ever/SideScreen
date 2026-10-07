@@ -792,6 +792,15 @@ struct SettingsView: View {
                                               status: settings.usbDeviceConnected ? "Detected" : "Not detected",
                                               color: settings.usbDeviceConnected ? .green : .red,
                                               hint: "An Android device authorized for ADB and visible to your Mac. Plug in via USB-C and tap Allow on the device's USB debugging prompt.")
+                                    Divider().padding(.vertical, 4)
+                                    Toggle("Keep tablet charging from Mac", isOn: $settings.usbChargingEnabled)
+                                        .font(.system(size: 12))
+                                    Text("Enable with only your tablet connected. Works while SideScreen is open in USB mode, even when streaming is stopped.")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary)
+                                    Text(settings.usbChargingStatus)
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary)
                                 } else {
                                     StatusRow(title: "WiFi",
                                               status: settings.wifiConnected ? "Connected" : "Disconnected",
@@ -1249,6 +1258,17 @@ class DisplaySettings: ObservableObject {
     @Published var startupMode: ConnectionMode {
         didSet { save("startupMode", startupMode.rawValue) }
     }
+    @Published var usbChargingEnabled: Bool {
+        didSet {
+            save("usbChargingEnabled", usbChargingEnabled)
+            if !usbChargingEnabled { usbChargingDeviceSerial = nil }
+        }
+    }
+    /// The tablet explicitly selected when charging recovery was enabled.
+    /// Never display or log its identifier.
+    @Published var usbChargingDeviceSerial: String? {
+        didSet { defaults.set(usbChargingDeviceSerial, forKey: keyPrefix + "usbChargingDeviceSerial") }
+    }
 
     // Runtime state (not persisted)
     @Published var displayCreated = false
@@ -1270,6 +1290,7 @@ class DisplaySettings: ObservableObject {
     @Published var adbInstalled = false
     @Published var adbReverseConfigured = false
     @Published var usbDeviceConnected = false
+    @Published var usbChargingStatus = "Off"
     @Published var wifiConnected = false
     @Published var listeningAddress: String?
     @Published var isRunning = false
@@ -1301,6 +1322,11 @@ class DisplaySettings: ObservableObject {
         self.autoStartStreamingOnLaunch = defaults.object(forKey: keyPrefix + "autoStartStreamingOnLaunch") as? Bool ?? false
         let startupRaw = defaults.string(forKey: keyPrefix + "startupMode") ?? modeRaw
         self.startupMode = ConnectionMode(rawValue: startupRaw) ?? .usb
+        let chargingSerial = defaults.string(forKey: keyPrefix + "usbChargingDeviceSerial")
+        let chargingEnabled = defaults.bool(forKey: keyPrefix + "usbChargingEnabled")
+            && chargingSerial != nil
+        self.usbChargingEnabled = chargingEnabled
+        self.usbChargingDeviceSerial = chargingEnabled ? chargingSerial : nil
 
         print("Loaded settings: \(resolution) @ \(refreshRate)Hz, bitrate=\(bitrate), quality=\(quality)")
     }
@@ -1364,7 +1390,8 @@ class DisplaySettings: ObservableObject {
     func resetToDefaults() {
         let keys = ["resolution", "refreshRate", "hiDPI", "bitrate", "quality",
                     "gamingBoost", "port", "rotation", "flipHorizontal", "flipVertical", "showAllResolutions",
-                    "customWidth", "customHeight", "touchEnabled", "autoStartStreamingOnLaunch", "startupMode"]
+                    "customWidth", "customHeight", "touchEnabled", "autoStartStreamingOnLaunch", "startupMode",
+                    "usbChargingEnabled", "usbChargingDeviceSerial"]
         for key in keys {
             defaults.removeObject(forKey: keyPrefix + key)
         }
@@ -1385,6 +1412,8 @@ class DisplaySettings: ObservableObject {
         touchEnabled = true
         autoStartStreamingOnLaunch = false
         startupMode = .usb
+        usbChargingEnabled = false
+        usbChargingDeviceSerial = nil
 
         print("Settings reset to defaults")
     }

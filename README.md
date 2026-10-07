@@ -168,6 +168,12 @@ cd AndroidClient && ./gradlew assembleDebug
 3. Open **Side Screen** on tablet → keep on the **USB** tab → tap **Connect**
 4. Done — drag windows to your new display
 
+#### Keep the tablet receiving power
+
+If reconnecting makes your tablet supply power to the Mac, connect only your intended tablet and enable **Keep tablet charging from Mac** in the Mac app's USB status section. The option is off by default and remembers that tablet. To choose another tablet, turn it off, connect only the replacement, and enable it again.
+
+SideScreen verifies the power direction and makes at most one correction per USB attachment. If verification fails, check the displayed status and reconnect or turn the option off and on to retry. Streaming Stop and closing the settings window leave charging recovery active. Quitting SideScreen, switching to Wireless, or disabling the option stops recovery without reversing the current power direction. It does not change the system's permanent USB negotiation policy or guarantee a particular charging rate.
+
 ### Wireless mode (new in 0.8.0 — no cable)
 
 1. Launch **Side Screen** on Mac → toggle to the **Wireless** tab → a QR code appears

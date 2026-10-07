@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Optional `SIDESCREEN_SIGNING_IDENTITY` for certificate-backed local Mac builds;
   reject an invalid selection before stopping the app or cleaning build outputs.
+- Optional **Keep tablet charging from Mac** recovery in USB mode. The Mac host binds the tablet selected when enabled, corrects outgoing USB power once per attachment, and verifies incoming power. Recovery stays active when streaming stops, but requires the Mac app to remain open. Unsafe or unsupported states are reported without repeated power-switch attempts.
 
 ### Planned
 - mDNS auto-discovery for wireless mode

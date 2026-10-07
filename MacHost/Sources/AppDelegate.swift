@@ -63,6 +63,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         requestAccess: { CGRequestScreenCaptureAccess() }
     )
     private var statusRefreshTimer: Timer?
+    @MainActor private var usbChargingIsAwake = true
+    @MainActor private lazy var usbChargingRecovery = USBChargingRecovery(
+        adbPath: { StatusDetector.adbExecutablePath() },
+        onStatus: { [weak self] status in
+            guard let self, self.settings.usbChargingStatus != status else { return }
+            self.settings.usbChargingStatus = status
+        },
+        onSelection: { [weak self] serial in
+            guard let self, self.settings.usbChargingDeviceSerial != serial else { return }
+            self.settings.usbChargingDeviceSerial = serial
+        },
+        onBridgeStatus: { [weak self] configured in
+            guard let self, self.settings.adbReverseConfigured != configured else { return }
+            self.settings.adbReverseConfigured = configured
+        },
+        bridgeAllowed: { [weak self] port in
+            guard let self else { return false }
+            return self.usbChargingIsAwake && self.settings.connectionMode == .usb
+                && (self.settings.isRunning || self.isStartingServer)
+                && self.settings.port == port
+        }
+    )
     /// Reentrancy latch for startServer() — a second Start (double-clicked menu
     /// item, auto-start racing a manual click) must not build a second virtual
     /// display / server. Main-actor confined.
@@ -83,6 +105,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Setup settings observers
         setupSettingsObservers()
+        setupUSBChargingLifecycle()
 
         // Check permissions
         Task {
@@ -137,6 +160,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func refreshStatusIndicators() {
+        refreshUSBChargingPolicy()
         settings.adbInstalled = StatusDetector.adbInstalled()
         settings.wifiConnected = StatusDetector.wifiReachable()
         settings.listeningAddress = LANAddressResolver.primaryIPv4()
@@ -171,7 +195,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let isConnected = !devices.isEmpty
 
                 self.settings.usbDeviceConnected = isConnected
-                self.settings.adbReverseConfigured = reverseOK
+                if !self.settings.usbChargingEnabled {
+                    self.settings.adbReverseConfigured = reverseOK
+                }
 
                 // Self-healing USB bridge (level-triggered, not edge-triggered):
                 // whenever we are in USB mode with the server running and a
@@ -182,6 +208,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if self.settings.connectionMode == .usb
                     && isConnected
                     && self.settings.isRunning
+                    && !self.settings.usbChargingEnabled
                     && !reverseOK {
                     debugLog("🔌 USB bridge missing while running — (re)establishing adb reverse")
                     Task { await self.setupADBReverse() }
@@ -192,6 +219,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func handleConnectionModeChange(to mode: ConnectionMode) async {
+        usbChargingRecovery.invalidate()
+        refreshUSBChargingPolicy()
         debugLog("Connection mode changed to: \(mode.rawValue)")
         // Disconnect any active client immediately (per spec §6 / fix #2).
         let wasRunning = settings.isRunning
@@ -271,8 +300,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .dropFirst()
             .sink { [weak self] mode in
                 guard let self = self else { return }
+                MainActor.assumeIsolated {
+                    self.usbChargingRecovery.invalidate()
+                    self.usbChargingRecovery.configure(
+                        enabled: self.settings.usbChargingEnabled,
+                        selectedSerial: self.settings.usbChargingDeviceSerial,
+                        eligible: mode == .usb && self.usbChargingIsAwake
+                    )
+                }
                 Task { @MainActor in
                     await self.handleConnectionModeChange(to: mode)
+                }
+            }
+            .store(in: &cancellables)
+
+        Publishers.CombineLatest(settings.$usbChargingEnabled, settings.$usbChargingDeviceSerial)
+            .dropFirst()
+            .removeDuplicates { $0.0 == $1.0 && $0.1 == $1.1 }
+            .sink { [weak self] enabled, serial in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.usbChargingRecovery.configure(
+                        enabled: enabled,
+                        selectedSerial: serial,
+                        eligible: self.settings.connectionMode == .usb && self.usbChargingIsAwake
+                    )
+                    self.usbChargingRecovery.poll(
+                        bridgePort: self.settings.isRunning ? self.settings.port : nil
+                    )
                 }
             }
             .store(in: &cancellables)
@@ -418,96 +473,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Setup ADB reverse port forwarding for USB connection
+    @MainActor
+    private func setupUSBChargingLifecycle() {
+        let center = NSWorkspace.shared.notificationCenter
+        center.publisher(for: NSWorkspace.willSleepNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.usbChargingIsAwake = false
+                    self.usbChargingRecovery.invalidate()
+                    self.refreshUSBChargingPolicy()
+                }
+            }
+            .store(in: &cancellables)
+        center.publisher(for: NSWorkspace.didWakeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.usbChargingIsAwake = true
+                    self.refreshUSBChargingPolicy()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    @MainActor
+    private func refreshUSBChargingPolicy() {
+        usbChargingRecovery.configure(
+            enabled: settings.usbChargingEnabled,
+            selectedSerial: settings.usbChargingDeviceSerial,
+            eligible: settings.connectionMode == .usb && usbChargingIsAwake
+        )
+        usbChargingRecovery.poll(bridgePort: settings.isRunning ? settings.port : nil)
+    }
+
+    /// USB bridge setup shares the charging command owner so the two cannot race.
+    @MainActor
     func setupADBReverse() async {
-        let port = settings.port
-        print("🔌 Setting up ADB reverse for port \(port)...")
-        debugLog("🔌 setupADBReverse() invoked for port \(port)...")
-
-        await Task.detached(priority: .utility) {
-            // Try common adb paths
-            let adbPaths = [
-                "/usr/local/bin/adb",
-                "/opt/homebrew/bin/adb",
-                "~/Library/Android/sdk/platform-tools/adb",
-                "/Users/\(NSUserName())/Library/Android/sdk/platform-tools/adb"
-            ]
-
-            var adbPath: String?
-            for path in adbPaths {
-                let expandedPath = NSString(string: path).expandingTildeInPath
-                if FileManager.default.fileExists(atPath: expandedPath) {
-                    adbPath = expandedPath
-                    break
-                }
-            }
-
-            // Also try 'which adb' to find it in PATH
-            if adbPath == nil {
-                let whichProcess = Process()
-                whichProcess.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-                whichProcess.arguments = ["adb"]
-                let whichPipe = Pipe()
-                whichProcess.standardOutput = whichPipe
-                whichProcess.standardError = FileHandle.nullDevice
-
-                do {
-                    try whichProcess.run()
-                    whichProcess.waitUntilExit()
-                    let data = whichPipe.fileHandleForReading.readDataToEndOfFile()
-                    if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                       !path.isEmpty {
-                        adbPath = path
-                    }
-                } catch {
-                    // Ignore
-                }
-            }
-
-            guard let finalAdbPath = adbPath else {
-                print("⚠️  ADB not found - USB connection may not work")
-                print("💡 Install Android SDK or run manually: adb reverse tcp:\(port) tcp:\(port)")
-                return
-            }
-
-            print("📱 Found ADB at: \(finalAdbPath)")
-
-            // Retry adb reverse up to 3 times — handles first-install authorization delay
-            for attempt in 1...3 {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: finalAdbPath)
-                process.arguments = ["reverse", "tcp:\(port)", "tcp:\(port)"]
-
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = pipe
-
-                do {
-                    try process.run()
-                    process.waitUntilExit()
-
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let output = String(data: data, encoding: .utf8) ?? ""
-
-                    if process.terminationStatus == 0 {
-                        print("✅ ADB reverse setup successful: tcp:\(port) -> tcp:\(port)")
-                        return
-                    } else {
-                        print("⚠️  ADB reverse attempt \(attempt)/3 failed: \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
-                        if attempt < 3 {
-                            try? await Task.sleep(nanoseconds: 1_000_000_000)
-                        }
-                    }
-                } catch {
-                    print("⚠️  Failed to run ADB (attempt \(attempt)/3): \(error.localizedDescription)")
-                    if attempt < 3 {
-                        try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    }
-                }
-            }
-
-            print("💡 Make sure Android device is connected via USB with debugging enabled")
-        }.value
+        guard settings.connectionMode == .usb, usbChargingIsAwake else { return }
+        usbChargingRecovery.configure(
+            enabled: settings.usbChargingEnabled,
+            selectedSerial: settings.usbChargingDeviceSerial,
+            eligible: true
+        )
+        let configured = await usbChargingRecovery.ensureBridge(port: settings.port)
+        debugLog(configured ? "USB bridge configured" : "USB bridge unavailable")
     }
 
     @MainActor
@@ -1194,7 +1206,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         momentumVelocityY = 0
     }
 
+    @MainActor
     func applicationWillTerminate(_ notification: Notification) {
+        statusRefreshTimer?.invalidate()
+        usbChargingRecovery.stop()
         // Stop momentum scrolling
         stopMomentumScroll()
 
