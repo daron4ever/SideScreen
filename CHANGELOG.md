@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Preserve decoder-supported native tablet resolutions to avoid unnecessary scaling and softened text; retain aligned fallback for unsupported sizes.
+
 ### Planned
 - mDNS auto-discovery for wireless mode
 - Audio streaming

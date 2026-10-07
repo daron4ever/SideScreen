@@ -131,10 +131,46 @@ object CodecCapabilities {
     ): Pair<Int, Int>? {
         if (panelWidth <= 0 || panelHeight <= 0) return null
         val caps = bestVideoCapabilities(mime) ?: return null
+        return selectStreamSize(
+            panelWidth,
+            panelHeight,
+            caps.supportedWidths.upper,
+            caps.supportedHeights.upper,
+            fps,
+        ) { width, height, rate -> caps.areSizeAndRateSupported(width, height, rate) }
+    }
+
+    /** Pure selection logic so native-size and fallback behavior can be tested without a device. */
+    internal fun selectStreamSize(
+        panelWidth: Int,
+        panelHeight: Int,
+        maxWidth: Int,
+        maxHeight: Int,
+        fps: Int,
+        supportsSizeAndRate: (Int, Int, Double) -> Boolean,
+    ): Pair<Int, Int>? {
+        if (panelWidth <= 0 || panelHeight <= 0) return null
         val rate = fps.coerceAtLeast(1).toDouble()
 
-        var w = panelWidth.coerceAtMost(caps.supportedWidths.upper)
-        var h = panelHeight.coerceAtMost(caps.supportedHeights.upper)
+        // Decoder capability checks already enforce its actual alignment. Preserve the native
+        // size when supported instead of forcing every tablet onto a 16-pixel grid. Keep even
+        // dimensions for the Mac's 4:2:0 capture path and retain the existing fallback otherwise.
+        if (panelWidth in 256..maxWidth && panelHeight in 256..maxHeight &&
+            panelWidth % 2 == 0 && panelHeight % 2 == 0
+        ) {
+            val nativeSupported =
+                try {
+                    supportsSizeAndRate(panelWidth, panelHeight, rate)
+                } catch (_: IllegalArgumentException) {
+                    false
+                } catch (_: Exception) {
+                    return null
+                }
+            if (nativeSupported) return panelWidth to panelHeight
+        }
+
+        var w = panelWidth.coerceAtMost(maxWidth)
+        var h = panelHeight.coerceAtMost(maxHeight)
         val aspect = panelWidth.toDouble() / panelHeight.toDouble()
 
         repeat(40) {
@@ -143,7 +179,7 @@ object CodecCapabilities {
             if (alignedW < 256 || alignedH < 256) return null
             val supported =
                 try {
-                    caps.areSizeAndRateSupported(alignedW, alignedH, rate)
+                    supportsSizeAndRate(alignedW, alignedH, rate)
                 } catch (_: IllegalArgumentException) {
                     false
                 } catch (_: Exception) {
