@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Preserve decoder-supported native tablet resolutions to avoid unnecessary scaling and softened text; retain aligned fallback for unsupported sizes.
+- Refresh screen-recording permission on app activation and request consent only
+  through an explicit user action; stop capture recovery on authorization denial.
+
+### Added
+- Optional `SIDESCREEN_SIGNING_IDENTITY` for certificate-backed local Mac builds;
+  reject an invalid selection before stopping the app or cleaning build outputs.
 
 ### Planned
 - mDNS auto-discovery for wireless mode

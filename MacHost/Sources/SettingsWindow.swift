@@ -817,7 +817,7 @@ struct SettingsView: View {
                                             .font(.system(size: 11))
                                             .foregroundColor(.secondary)
                                         Button(action: {
-                                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+                                            (NSApp.delegate as? AppDelegate)?.requestScreenRecordingPermission()
                                         }) {
                                             HStack {
                                                 Image(systemName: "gear")

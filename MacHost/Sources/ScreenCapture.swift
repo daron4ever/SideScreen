@@ -80,6 +80,7 @@ class ScreenCapture {
     private var lastPixelBuffer: CVPixelBuffer?
 
     /// Callback when capture method changes (e.g. SCStream → CGDisplayStream fallback)
+    var onPermissionDenied: (() -> Void)?
     var onCaptureMethodChanged: ((String) -> Void)?
 
     /// Force the encoder to emit an IDR keyframe on the next frame.
@@ -287,6 +288,7 @@ class ScreenCapture {
             do {
                 content = try await getShareableContentWithTimeout(seconds: 10)
             } catch {
+                if isScreenRecordingPermissionDenied(error) { throw error }
                 debugLog("SCShareableContent attempt \(attempt) failed: \(error.localizedDescription)")
                 if attempt < 5 {
                     try await Task.sleep(nanoseconds: 1_000_000_000)
@@ -332,8 +334,9 @@ class ScreenCapture {
         streamOutput = output
 
         let delegate = StreamDelegate()
-        delegate.onStreamError = { [weak self] _ in
-            guard let self = self else { return }
+        delegate.onStreamError = { [weak self, weak delegate] error in
+            guard let self = self, let delegate, self.streamDelegate === delegate else { return }
+            if self.handlePermissionFailure(error) { return }
             debugLog("StreamDelegate error callback — attempting fallback")
             let alreadyActive = self.stateLock.withLock { $0.fallbackActive }
             if !alreadyActive {
@@ -461,13 +464,18 @@ class ScreenCapture {
         }
 
         configureFrameHandler(label: "initial")
+        let initialGeneration = streamGeneration
+        let initialStream = stream
 
         Task {
             do {
-                try await stream?.startCapture()
+                try await initialStream?.startCapture()
+                guard isStreaming, initialGeneration == streamGeneration else { return }
                 debugLog("SCStream capture started — starting frame flow monitor (3s interval, 5s timeout)")
                 startFrameMonitor()
             } catch {
+                guard isStreaming, initialGeneration == streamGeneration else { return }
+                if handlePermissionFailure(error) { return }
                 debugLog("Failed to start SCStream capture: \(error)")
                 debugLog("Attempting CGDisplayStream fallback due to start failure")
                 attemptFallbackCapture()
@@ -540,6 +548,14 @@ class ScreenCapture {
         frameMonitorTimer = nil
     }
 
+    /// A denial requires user action, not another capture API or retry loop.
+    private func handlePermissionFailure(_ error: Error) -> Bool {
+        guard isScreenRecordingPermissionDenied(error) else { return false }
+        stopFrameMonitor()
+        onPermissionDenied?()
+        return true
+    }
+
     // MARK: - Stream restart
 
     private func restartStream() {
@@ -596,6 +612,8 @@ class ScreenCapture {
                 debugLog("SCStream restarted — starting frame flow monitor")
                 startFrameMonitor()
             } catch {
+                guard isStreaming, gen == streamGeneration else { return }
+                if handlePermissionFailure(error) { return }
                 debugLog("SCStream restart failed: \(error) — falling back to CGDisplayStream")
                 if isStreaming, gen == streamGeneration {
                     attemptFallbackCapture()

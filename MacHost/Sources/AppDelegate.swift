@@ -58,7 +58,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// shows "just now" while connected and freezes at the disconnect moment afterward.
     private var currentWirelessDevice: String?
     private var cancellables = Set<AnyCancellable>()
-    private var permissionCheckTimer: Timer?
+    @MainActor private lazy var screenRecordingPermission = ScreenRecordingPermission(
+        preflight: { CGPreflightScreenCaptureAccess() },
+        requestAccess: { CGRequestScreenCaptureAccess() }
+    )
     private var statusRefreshTimer: Timer?
     /// Reentrancy latch for startServer() — a second Start (double-clicked menu
     /// item, auto-start racing a manual click) must not build a second virtual
@@ -204,10 +207,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Check permissions on demand (called when settings window opens or manually)
-    func refreshPermissions() {
-        Task {
-            await checkPermissions()
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Task { await checkPermissions() }
+    }
+
+    @MainActor
+    func requestScreenRecordingPermission() {
+        settings.hasScreenRecordingPermission = screenRecordingPermission.request()
+        if !settings.hasScreenRecordingPermission {
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
         }
     }
 
@@ -378,30 +386,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func checkPermissions() async {
-        let version = ProcessInfo.processInfo.operatingSystemVersion
-        debugLog("checkPermissions — macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)")
-
-        // Check Screen Recording permission using CoreGraphics API
-        let hasScreenCapture = CGPreflightScreenCaptureAccess()
         await MainActor.run {
-            settings.hasScreenRecordingPermission = hasScreenCapture
-        }
-        if hasScreenCapture {
-            debugLog("Screen recording permission granted (CGPreflight)")
-
-            // On macOS 26+, also verify ScreenCaptureKit is actually functional
-            if version.majorVersion >= 26 {
-                do {
-                    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-                    debugLog("SCShareableContent verification OK — \(content.displays.count) displays found")
-                } catch {
-                    debugLog("WARNING: CGPreflight OK but SCShareableContent failed on macOS 26: \(error.localizedDescription)")
-                    debugLog("CGDisplayStream fallback will likely activate at capture time")
-                }
-            }
-        } else {
-            debugLog("Screen recording permission not granted yet")
-            CGRequestScreenCaptureAccess()
+            settings.hasScreenRecordingPermission = screenRecordingPermission.refresh()
         }
 
         // Check Accessibility permission (required for touch/mouse injection)
@@ -560,6 +546,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         defer {
             Task { @MainActor [weak self] in self?.isStartingServer = false }
         }
+        await checkPermissions()
         debugLog("🚀 startServer() invoked. Check permission: \(settings.hasScreenRecordingPermission)")
         guard settings.hasScreenRecordingPermission else {
             debugLog("❌ startServer aborted: Missing Screen Recording permission")
@@ -620,6 +607,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 )
             }
             screenCapture = try await ScreenCapture()
+            if let capture = screenCapture {
+                capture.onPermissionDenied = { [weak self, weak capture] in
+                    Task { @MainActor in
+                        guard let self, let capture, self.screenCapture === capture else { return }
+                        self.settings.hasScreenRecordingPermission = false
+                        self.stopServer()
+                        self.showSettings()
+                    }
+                }
+            }
             screenCapture?.onCaptureMethodChanged = { [weak self] method in
                 guard let self = self else { return }
                 debugLog("Capture method: \(method)")
@@ -729,6 +726,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             await MainActor.run {
                 self.tearDownServerResources(saveDisplayPosition: false)
 
+                if isScreenRecordingPermissionDenied(error) {
+                    self.settings.hasScreenRecordingPermission = false
+                    self.showSettings()
+                    return
+                }
                 let alert = NSAlert()
                 alert.messageText = "Failed to Start Server"
                 alert.informativeText = error.localizedDescription
