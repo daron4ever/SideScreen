@@ -45,6 +45,92 @@ final class USBChargingProcessBoundaryTests: XCTestCase {
         XCTAssertLessThan(elapsed(since: started), 1.5)
     }
 
+    func testMalformedStandardOutputFailsEvenWhenTheProcessExitsSuccessfully() async {
+        let runner = makeRunner(timeout: 3)
+
+        let result = await runner.run(["-c", "printf '\\377'"])
+
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(result.failure, .invalidOutput)
+        XCTAssertFalse(result.succeeded)
+        XCTAssertEqual(result.output, "")
+    }
+
+    func testMalformedStandardErrorFailsEvenWhenTheProcessExitsSuccessfully() async {
+        let runner = makeRunner(timeout: 3)
+
+        let result = await runner.run(["-c", "printf 'valid stdout'; printf '\\377' >&2"])
+
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(result.failure, .invalidOutput)
+        XCTAssertFalse(result.succeeded)
+        XCTAssertEqual(result.output, "")
+    }
+
+    func testMultibyteScalarsSplitAcrossReadsStayWithinTheirOwnPipe() async {
+        let runner = makeRunner(timeout: 3)
+        let script = """
+        i=0
+        while [ "$i" -lt 4095 ]; do
+            printf 'o'
+            i=$((i + 1))
+        done
+        printf '\\342'
+        i=0
+        while [ "$i" -lt 4095 ]; do
+            printf 'e' >&2
+            i=$((i + 1))
+        done
+        printf '\\360' >&2
+        /bin/sleep 0.05
+        printf '\\202\\254'
+        printf '\\237\\230\\200' >&2
+        """
+        let expectedOutput = String(repeating: "o", count: 4095) + "€"
+        let expectedError = String(repeating: "e", count: 4095) + "😀"
+
+        let result = await runner.run(["-c", script])
+
+        XCTAssertTrue(result.succeeded)
+        XCTAssertNil(result.failure)
+        XCTAssertEqual(result.output, expectedOutput + expectedError)
+    }
+
+    func testOutputCeilingKeepsPriorityWhenItTruncatesAMultibyteScalar() async {
+        let runner = makeRunner(timeout: 3, outputLimit: 2)
+
+        let result = await runner.run(["-c", "printf '\\342\\202\\254'"])
+
+        XCTAssertEqual(result.failure, .outputLimit)
+        XCTAssertFalse(result.succeeded)
+        XCTAssertEqual(result.output, "")
+    }
+
+    func testDeadlineKeepsPriorityWhenOutputEndsWithAnIncompleteScalar() async {
+        let runner = makeRunner(timeout: 0.15)
+
+        let result = await runner.run(["-c", "printf '\\342'; exec /bin/sleep 3"])
+
+        XCTAssertEqual(result.failure, .timeout)
+        XCTAssertFalse(result.succeeded)
+        XCTAssertEqual(result.output, "")
+    }
+
+    func testCancellationKeepsPriorityWhenOutputEndsWithAnIncompleteScalar() async throws {
+        let runner = makeRunner(timeout: 3)
+        let operation = Task {
+            await runner.run(["-c", "printf '\\342'; exec /bin/sleep 3"])
+        }
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        operation.cancel()
+        let result = await operation.value
+
+        XCTAssertEqual(result.failure, .cancelled)
+        XCTAssertFalse(result.succeeded)
+        XCTAssertEqual(result.output, "")
+    }
+
     func testDeadlineTerminatesAnOwnedProcess() async {
         let runner = makeRunner(timeout: 0.15)
         let started = DispatchTime.now().uptimeNanoseconds

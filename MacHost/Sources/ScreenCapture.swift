@@ -200,8 +200,9 @@ class ScreenCapture {
         // Duplicate display/system wake notifications do not schedule a second
         // rebuild. Sleep and Stop invalidate this ticket before the delay ends.
         wakeRestartTask = Task { @MainActor [weak self] in
-            do { try await Task.sleep(nanoseconds: 2_000_000_000) }
-            catch { return }
+            do {
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+            } catch { return }
             guard let self, self.permitsCapture(ticket), !Task.isCancelled else { return }
             self.wakeRestartTask = nil
             self.restartStream()
