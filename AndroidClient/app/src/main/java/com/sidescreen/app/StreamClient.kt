@@ -27,8 +27,10 @@ class StreamClient(
     private var socket: Socket? = null
     private var inputStream: DataInputStream? = null
     private var outputStream: java.io.DataOutputStream? = null
+
     @Volatile private var isConnected = false
     private val connectionLock = Any()
+
     @Volatile private var closeRequested = false
     private val hostPingTracker = HostPingTracker()
 
@@ -376,7 +378,8 @@ class StreamClient(
                     outputStream = java.io.DataOutputStream(s.getOutputStream())
                     streamCodecIsHevc = true
                     codecNegotiated = false
-                    advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
+                    // MUST precede type 8: type 8 can trigger the server's early protocol finish
+                    advertiseAvcOnlyIfNeeded()
                     advertiseDecoderLimits() // Also before type 8, for the same reason
                     advertiseDesktopGeometrySupport() // Likewise
                     advertiseHostDisplayStateSupport()
