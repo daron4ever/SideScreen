@@ -168,6 +168,12 @@ cd AndroidClient && ./gradlew assembleDebug
 3. Open **Side Screen** on tablet → keep on the **USB** tab → tap **Connect**
 4. Done — drag windows to your new display
 
+#### Keep the tablet receiving power
+
+If reconnecting makes your tablet supply power to the Mac, connect only your intended tablet and enable **Keep tablet charging from Mac** in the Mac app's USB status section. The option is off by default and remembers that tablet. To choose another tablet, turn it off, connect only the replacement, and enable it again.
+
+SideScreen verifies the power direction and makes at most one correction per USB attachment. If verification fails, check the displayed status and reconnect or turn the option off and on to retry. Streaming Stop and closing the settings window leave charging recovery active. Quitting SideScreen, switching to Wireless, or disabling the option stops recovery without reversing the current power direction. It does not change the system's permanent USB negotiation policy or guarantee a particular charging rate.
+
 ### Wireless mode (new in 0.8.0 — no cable)
 
 1. Launch **Side Screen** on Mac → toggle to the **Wireless** tab → a QR code appears
@@ -183,6 +189,12 @@ USB mode remains the lowest-latency option for drawing or fast-paced gaming. Wir
 In Settings → Startup, turn on **Launch at Login** and **Auto-start streaming on launch**, then pick the **Startup mode** (USB or Wireless). On your next login the server starts automatically — just open Side Screen on the tablet and tap Connect (USB) or Reconnect (Wireless).
 
 First-time setup still needs a screen once to grant Screen Recording permission; after that the Mac runs fully headless. For wireless headless use, give the Mac a static IP or DHCP reservation, and consider enabling macOS Screen Sharing as a fallback way in.
+
+### Screen sleep
+
+SideScreen lets the Mac follow its configured display timeout. With both apps updated, the tablet stays awake while the Mac display is active. When the Mac display sleeps, the tablet allows its own configured screen timeout; the screens do not necessarily turn off at exactly the same instant. A disconnected or unresponsive host also releases the tablet's keep-awake request.
+
+Wake the Mac normally to resume capture. You may need to wake and unlock the tablet with its power button. If the connection survived, the tablet restores its video surface; if it was lost, use Connect or Reconnect. Screen timeout, device locking, and full system sleep remain controlled by the operating systems. An older Mac cannot signal its display-sleep state to the tablet.
 
 ---
 

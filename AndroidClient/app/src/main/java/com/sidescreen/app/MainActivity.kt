@@ -16,7 +16,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import android.view.MotionEvent
 import android.view.Surface
@@ -52,7 +52,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: PreferencesManager
     private var videoDecoder: VideoDecoder? = null
-    private var streamClient: StreamClient? = null
+    @Volatile private var streamClient: StreamClient? = null
 
     /** In-flight code-pairing attempt (issue #35); cancelled when its dialog closes. */
     private var pairingJob: Job? = null
@@ -70,7 +70,6 @@ class MainActivity : AppCompatActivity() {
     private var displayRotation = 0 // 0, 90, 180, 270 degrees
     private var displayFlipHorizontal = false
     private var displayFlipVertical = false
-    private var wakeLock: PowerManager.WakeLock? = null
     private var pingJob: kotlinx.coroutines.Job? = null
 
     // For dragging stats overlay
@@ -86,6 +85,11 @@ class MainActivity : AppCompatActivity() {
     private var checklistRunnable: Runnable? = null
     private var isConnected = false // Track connection state to prevent checklist conflicts
 
+    // Main-thread-only refresh ownership, separate from asynchronous UI status callbacks.
+    private var refreshResumed = false
+    private val refreshRequest = StreamingRefreshRequest()
+    private val displaySleepPolicy = StreamingDisplaySleepPolicy()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -94,9 +98,6 @@ class MainActivity : AppCompatActivity() {
 
         // Allow rotation based on device sensor when not connected
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
-
-        // Keep screen on
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         // Enable edge-to-edge display (draw behind system bars and cutout)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -109,9 +110,6 @@ class MainActivity : AppCompatActivity() {
 
         // Apply fullscreen mode immediately
         enableFullscreenMode()
-
-        // Enable performance mode for gaming (after binding is initialized)
-        enablePerformanceMode()
 
         setupSurface()
         setupUI()
@@ -226,35 +224,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Enable performance mode for streaming
-     * NOTE: setSustainedPerformanceMode is DISABLED - it causes thermal throttling
-     * which makes the entire device laggy. Normal power management is more efficient.
-     */
-    private fun enablePerformanceMode() {
-        try {
-            // REMOVED: setSustainedPerformanceMode(true)
-            // Sustained performance mode forces max CPU/GPU clocks which causes
-            // thermal throttling on extended use, making the device laggy.
-            // Let the SoC manage power efficiently instead.
-
-            // Use PARTIAL_WAKE_LOCK with timeout to prevent battery drain
-            // Screen is already kept on via FLAG_KEEP_SCREEN_ON
-            val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock =
-                powerManager.newWakeLock(
-                    PowerManager.PARTIAL_WAKE_LOCK,
-                    "SideScreen::PerformanceMode",
-                )
-            // 30 minute timeout instead of infinite acquire
-            wakeLock?.acquire(30 * 60 * 1000L)
-
-            log("🎮 Performance mode ENABLED (balanced)")
-        } catch (e: Exception) {
-            log("⚠️ Performance mode failed: ${e.message}")
-        }
-    }
-
-    /**
      * Enable fullscreen immersive mode
      * Uses modern WindowInsets API on Android R+ for better system compatibility
      * Also handles display cutout (notch) to use full screen area
@@ -316,6 +285,7 @@ class MainActivity : AppCompatActivity() {
                     log("Surface changed: ${width}x$height")
                     currentSurfaceHolder = holder
                     initializeDecoderForCurrentSurface()
+                    updateStreamingRefreshRate()
                 }
 
                 override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -326,6 +296,7 @@ class MainActivity : AppCompatActivity() {
                         videoDecoder = null
                     }
                     currentSurfaceHolder = null
+                    updateStreamingRefreshRate()
                 }
             },
         )
@@ -340,6 +311,7 @@ class MainActivity : AppCompatActivity() {
                     mainDiag("textureAvailable: ${width}x$height")
                     currentTextureSurface = Surface(surface)
                     initializeDecoderForCurrentSurface()
+                    updateStreamingRefreshRate()
                 }
 
                 override fun onSurfaceTextureSizeChanged(
@@ -359,6 +331,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     currentTextureSurface?.release()
                     currentTextureSurface = null
+                    updateStreamingRefreshRate()
                     return true
                 }
 
@@ -1047,28 +1020,42 @@ class MainActivity : AppCompatActivity() {
     /**
      * Wire up all StreamClient callbacks. Used by both USB connect() and wireless connectWireless().
      */
-    private fun setupStreamClientCallbacks() {
-        streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
+    private fun setupStreamClientCallbacks(
+        client: StreamClient,
+        refreshAttempt: Long,
+    ) {
+        client.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
             val dec = videoDecoder
-            if (dec != null) {
+            if (streamClient === client && dec != null) {
                 dec.decode(frameData, frameSize, timestamp, isKeyframe)
             } else {
-                mainDiag("FRAME DROPPED: videoDecoder is null!")
+                client.releaseBuffer(frameData)
             }
         }
 
         videoDecoder?.onFrameDecoded = { buffer ->
-            streamClient?.releaseBuffer(buffer)
+            client.releaseBuffer(buffer)
         }
 
-        streamClient?.onLatencyMeasured = { rttMs ->
+        videoDecoder?.onKeyframeRequired = { force, reason ->
+            client.requestKeyframe(force = force, reason = reason)
+        }
+
+        client.onLatencyMeasured = { rttMs ->
             runOnUiThread {
+                if (streamClient !== client || isDestroyed) return@runOnUiThread
                 binding.latencyText.text = String.format("%.1f ms", rttMs)
             }
         }
 
-        streamClient?.onConnectionStatus = { connected ->
+        client.onConnectionStatus = { connected ->
             runOnUiThread {
+                if (streamClient !== client || isDestroyed ||
+                    (connected && !displaySleepPolicy.isCurrentAttempt(refreshAttempt))
+                ) return@runOnUiThread
+                updateRefreshConnection(refreshAttempt, connected)
+                displaySleepPolicy.updateConnection(refreshAttempt, connected)
+                updateDisplaySleepPolicy()
                 isConnected = connected
                 if (connected) {
                     updateStatus("Connected - Streaming active")
@@ -1081,7 +1068,7 @@ class MainActivity : AppCompatActivity() {
                     if (connected) android.R.color.holo_green_light else android.R.color.holo_red_light,
                 )
                 if (connected) {
-                    startPingTimer()
+                    startPingTimer(client, refreshAttempt)
                     stopChecklistUpdates()
                     enableFullscreenMode()
                     binding.settingsPanel.visibility = View.GONE
@@ -1124,32 +1111,42 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        streamClient?.onDesktopSize = { w, h ->
-            desktopWidth = w
-            desktopHeight = h
-            runOnUiThread { updateResolutionOverlay() }
+        client.onDesktopSize = { w, h ->
+            runOnUiThread {
+                if (!isCurrentDisplayConnection(client, refreshAttempt)) return@runOnUiThread
+                desktopWidth = w
+                desktopHeight = h
+                updateResolutionOverlay()
+            }
         }
 
-        streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
-
-        streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
-            mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
-            warnIfAvcOnlyWithoutNegotiation()
-            displayWidth = width
-            displayHeight = height
-            displayRotation = rotation
-            displayFlipHorizontal = flipHorizontal
-            displayFlipVertical = flipVertical
+        client.onCodecSelected = { isHevc ->
             runOnUiThread {
+                if (!isCurrentDisplayConnection(client, refreshAttempt)) return@runOnUiThread
+                onStreamCodecSelected(isHevc)
+            }
+        }
+
+        client.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
+            mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
+            runOnUiThread {
+                if (!isCurrentDisplayConnection(client, refreshAttempt)) return@runOnUiThread
+                warnIfAvcOnlyWithoutNegotiation()
+                displayWidth = width
+                displayHeight = height
+                displayRotation = rotation
+                displayFlipHorizontal = flipHorizontal
+                displayFlipVertical = flipVertical
                 updateResolutionOverlay()
                 applyRotation(rotation, flipHorizontal, flipVertical)
                 initializeDecoderForCurrentSurface()
+                log("Display: ${width}x$height @ $rotation°")
             }
-            log("Display: ${width}x$height @ $rotation°")
         }
 
-        streamClient?.onStats = { fps, mbps ->
+        client.onStats = { fps, mbps ->
             runOnUiThread {
+                if (!isCurrentDisplayConnection(client, refreshAttempt)) return@runOnUiThread
                 binding.fpsText.text = String.format("%.1f", fps)
                 binding.bitrateText.text = String.format("%.1f Mbps", mbps)
             }
@@ -1275,23 +1272,38 @@ class MainActivity : AppCompatActivity() {
         deviceName: String,
         macName: String,
     ) {
+        val refreshAttempt = refreshRequest.beginConnection()
+        displaySleepPolicy.beginConnection(refreshAttempt)
+        updateDisplaySleepPolicy()
+        updateStreamingRefreshRate()
+        stopPingTimer()
+        val previousClient = streamClient
+        val client = StreamClient(host, port, applicationContext)
+        streamClient = client
+        setupHostDisplayCallbacks(client, refreshAttempt)
+        setupStreamClientCallbacks(client, refreshAttempt)
+        previousClient?.disconnect()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting wirelessly to $host:$port...")
-                streamClient = StreamClient(host, port, applicationContext)
-                setupStreamClientCallbacks()
-                streamClient?.connectWireless(token, deviceName)
+                client.connectWireless(token, deviceName)
                 // NOTE: onConnectSuccess is fired from the onConnectionStatus(true)
                 // listener (above) right after handshake OK — not here. This line
                 // would otherwise run AFTER the receive loop exits, i.e. AFTER
                 // disconnect, incorrectly transitioning back to CONNECTED.
             } catch (e: StreamClient.WirelessConnectError) {
                 runOnUiThread {
+                    if (!isCurrentDisplayConnection(client, refreshAttempt)) return@runOnUiThread
+                    displaySleepPolicy.endConnection()
+                    updateDisplaySleepPolicy()
                     wirelessController.onConnectError(e)
                 }
             } catch (e: Exception) {
                 log("Wireless connect failed: ${e.message}")
                 runOnUiThread {
+                    if (!isCurrentDisplayConnection(client, refreshAttempt)) return@runOnUiThread
+                    displaySleepPolicy.endConnection()
+                    updateDisplaySleepPolicy()
                     wirelessController.onConnectError(StreamClient.WirelessConnectError.NetworkUnreachable)
                 }
             }
@@ -1302,127 +1314,22 @@ class MainActivity : AppCompatActivity() {
         host: String,
         port: Int,
     ) {
+        val refreshAttempt = refreshRequest.beginConnection()
+        displaySleepPolicy.beginConnection(refreshAttempt)
+        updateDisplaySleepPolicy()
+        updateStreamingRefreshRate()
+        stopPingTimer()
+        val previousClient = streamClient
+        val client = StreamClient(host, port, applicationContext)
+        streamClient = client
+        setupHostDisplayCallbacks(client, refreshAttempt)
+        setupStreamClientCallbacks(client, refreshAttempt)
+        previousClient?.disconnect()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting to $host:$port...")
 
-                streamClient = StreamClient(host, port, applicationContext)
-                streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
-                    val dec = videoDecoder
-                    if (dec != null) {
-                        dec.decode(frameData, frameSize, timestamp, isKeyframe)
-                    } else {
-                        streamClient?.releaseBuffer(frameData)
-                    }
-                }
-
-                // Wire up buffer release callback for buffer pooling
-                // When decode completes, buffer is returned to StreamClient's pool
-                videoDecoder?.onFrameDecoded = { buffer ->
-                    streamClient?.releaseBuffer(buffer)
-                }
-                videoDecoder?.onKeyframeRequired = { force, reason ->
-                    streamClient?.requestKeyframe(force = force, reason = reason)
-                }
-
-                // Latency measurement via ping/pong
-                streamClient?.onLatencyMeasured = { rttMs ->
-                    runOnUiThread {
-                        binding.latencyText.text = String.format("%.1f ms", rttMs)
-                    }
-                }
-
-                streamClient?.onConnectionStatus = { connected ->
-                    runOnUiThread {
-                        // Update connection state flag
-                        isConnected = connected
-
-                        if (connected) {
-                            updateStatus("Connected - Streaming active")
-                        } else {
-                            updateStatus("Disconnected")
-                        }
-
-                        binding.connectButton.isEnabled = !connected
-                        binding.disconnectButton.isEnabled = connected
-
-                        // Update status indicator color
-                        binding.statusIndicator.setBackgroundResource(
-                            if (connected) {
-                                android.R.color.holo_green_light
-                            } else {
-                                android.R.color.holo_red_light
-                            },
-                        )
-
-                        if (connected) {
-                            // Start periodic ping for latency measurement
-                            startPingTimer()
-
-                            // Stop checklist updates when connected (prevents socket conflicts)
-                            stopChecklistUpdates()
-
-                            // Enter fullscreen mode when connected
-                            enableFullscreenMode()
-
-                            binding.settingsPanel.visibility = View.GONE
-                            applySettingsButtonVisibility()
-                            restoreSettingsButtonPosition()
-                            updateOverlayVisibility(prefs.showStatsOverlay)
-                        } else {
-                            // Stop ping timer
-                            stopPingTimer()
-
-                            // Exit fullscreen mode when disconnected
-                            disableFullscreenMode()
-
-                            // Reset to follow device sensor when disconnected
-                            resetOrientationToSensor()
-
-                            binding.settingsPanel.visibility = View.VISIBLE
-                            binding.settingsButton.visibility = View.GONE
-                            binding.statusBar.visibility = View.GONE
-
-                            // Restart checklist updates immediately
-                            log("📋 Restarting checklist updates")
-                            startChecklistUpdates()
-                        }
-                    }
-                }
-
-                streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
-
-                streamClient?.onDesktopSize = { w, h ->
-                    desktopWidth = w
-                    desktopHeight = h
-                    runOnUiThread { updateResolutionOverlay() }
-                }
-
-                streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
-                    mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
-                    warnIfAvcOnlyWithoutNegotiation()
-                    displayWidth = width
-                    displayHeight = height
-                    displayRotation = rotation
-                    displayFlipHorizontal = flipHorizontal
-                    displayFlipVertical = flipVertical
-
-                    runOnUiThread {
-                        updateResolutionOverlay()
-                        applyRotation(rotation, flipHorizontal, flipVertical)
-                        initializeDecoderForCurrentSurface()
-                    }
-                    log("Display: ${width}x$height @ $rotation°")
-                }
-
-                streamClient?.onStats = { fps, mbps ->
-                    runOnUiThread {
-                        binding.fpsText.text = String.format("%.1f", fps)
-                        binding.bitrateText.text = String.format("%.1f Mbps", mbps)
-                    }
-                }
-
-                streamClient?.connect()
+                client.connect()
             } catch (e: Exception) {
                 val errorMessage =
                     when {
@@ -1445,13 +1352,25 @@ class MainActivity : AppCompatActivity() {
                                 "• Check USB connection\n• Run: adb reverse tcp:$port tcp:$port"
                         }
                     }
-                updateStatus("Connection failed")
-                showError(errorMessage)
+                runOnUiThread {
+                    if (!isCurrentDisplayConnection(client, refreshAttempt)) return@runOnUiThread
+                    displaySleepPolicy.endConnection()
+                    updateDisplaySleepPolicy()
+                    updateStatus("Connection failed")
+                    showError(errorMessage)
+                }
             }
         }
     }
 
     private fun disconnect() {
+        // Release even if the transport never delivers its disconnect callback.
+        runOnUiThread {
+            refreshRequest.endConnection()
+            displaySleepPolicy.endConnection()
+            updateDisplaySleepPolicy()
+            updateStreamingRefreshRate()
+        }
         stopPingTimer()
         streamClient?.disconnect()
         // Reset display config so next connect defers decoder init until config arrives
@@ -1468,13 +1387,18 @@ class MainActivity : AppCompatActivity() {
         log("Disconnected")
     }
 
-    private fun startPingTimer() {
+    private fun startPingTimer(
+        client: StreamClient,
+        attempt: Long,
+    ) {
         stopPingTimer()
         pingJob =
-            lifecycleScope.launch(Dispatchers.IO) {
+            lifecycleScope.launch {
                 while (true) {
                     kotlinx.coroutines.delay(1000) // Ping every 1 second
-                    streamClient?.sendPing()
+                    if (!isCurrentDisplayConnection(client, attempt)) break
+                    client.sendPing()
+                    updateDisplaySleepPolicy()
                 }
             }
     }
@@ -1491,17 +1415,6 @@ class MainActivity : AppCompatActivity() {
             videoDecoder = null
             currentTextureSurface?.release()
             currentTextureSurface = null
-
-            // Release wake lock safely
-            try {
-                if (wakeLock?.isHeld == true) {
-                    wakeLock?.release()
-                }
-            } catch (e: Exception) {
-                // Ignore wake lock release errors
-            }
-            wakeLock = null
-            log("🎮 Performance mode DISABLED")
         } catch (e: Exception) {
             log("⚠️ Cleanup error: ${e.message}")
         }
@@ -1580,6 +1493,7 @@ class MainActivity : AppCompatActivity() {
         binding.surfaceView.visibility = View.VISIBLE
         binding.textureView.visibility = if (flipHorizontal || flipVertical) View.VISIBLE else View.GONE
         applyTextureTransform()
+        updateStreamingRefreshRate()
 
         log(
             "🔄 Orientation: ${when (rotation) {
@@ -1620,7 +1534,103 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun updateRefreshConnection(
+        attempt: Long,
+        connected: Boolean,
+    ) {
+        if (isDestroyed) return
+        refreshRequest.updateConnection(attempt, connected)
+        updateStreamingRefreshRate()
+    }
+
+    private fun isCurrentDisplayConnection(
+        client: StreamClient,
+        attempt: Long,
+    ): Boolean = streamClient === client && displaySleepPolicy.isCurrentAttempt(attempt) && !isDestroyed
+
+    private fun setupHostDisplayCallbacks(
+        client: StreamClient,
+        attempt: Long,
+    ) {
+        client.onHostReply = { receivedAtMs ->
+            runOnUiThread {
+                if (!isCurrentDisplayConnection(client, attempt)) return@runOnUiThread
+                displaySleepPolicy.receiveHostReply(attempt, receivedAtMs)
+                updateDisplaySleepPolicy()
+            }
+        }
+        client.onHostDisplayState = { awake ->
+            // Capture on the receive thread: a queued callback is never stamped fresh by the UI.
+            val receivedAtMs = SystemClock.elapsedRealtime()
+            runOnUiThread {
+                if (!isCurrentDisplayConnection(client, attempt)) return@runOnUiThread
+                displaySleepPolicy.receiveHostDisplayState(attempt, awake, receivedAtMs)
+                updateDisplaySleepPolicy()
+                if (awake && refreshResumed) client.requestKeyframe(reason = "host display awake")
+            }
+        }
+    }
+
+    private fun updateDisplaySleepPolicy() {
+        val keepOn =
+            displaySleepPolicy.shouldKeepScreenOn(
+                resumed = refreshResumed && !isDestroyed,
+                nowMs = SystemClock.elapsedRealtime(),
+            )
+        val currentlyKeepOn = window.attributes.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON != 0
+        if (keepOn == currentlyKeepOn) return
+        if (keepOn) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    private fun updateStreamingRefreshRate() {
+        val display = binding.root.display
+        val mode = display?.mode
+        val rates =
+            display?.supportedModes
+                ?.filter { mode != null && it.physicalWidth == mode.physicalWidth && it.physicalHeight == mode.physicalHeight }
+                ?.map { it.refreshRate }
+                .orEmpty()
+        val requested =
+            refreshRequest.preferredRate(
+                resumed = refreshResumed && !isDestroyed,
+                hasSurface = activeVideoSurface() != null,
+                supportedRates = rates,
+            )
+        val attributes = window.attributes
+        if (attributes.preferredRefreshRate == requested) return
+        attributes.preferredRefreshRate = requested
+        window.attributes = attributes
+        mainDiag("Refresh request: hz=$requested")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshResumed = true
+        updateDisplaySleepPolicy()
+        updateStreamingRefreshRate()
+        if (isConnected) {
+            initializeDecoderForCurrentSurface()
+            streamClient?.requestKeyframe(reason = "activity resumed")
+        }
+    }
+
+    override fun onPause() {
+        refreshResumed = false
+        updateDisplaySleepPolicy()
+        updateStreamingRefreshRate()
+        super.onPause()
+    }
+
     override fun onDestroy() {
+        refreshResumed = false
+        refreshRequest.endConnection()
+        displaySleepPolicy.endConnection()
+        updateDisplaySleepPolicy()
+        updateStreamingRefreshRate()
         super.onDestroy()
         stopChecklistUpdates()
         cleanup()

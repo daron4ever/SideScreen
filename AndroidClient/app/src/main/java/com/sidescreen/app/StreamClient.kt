@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -26,7 +27,10 @@ class StreamClient(
     private var socket: Socket? = null
     private var inputStream: DataInputStream? = null
     private var outputStream: java.io.DataOutputStream? = null
-    private var isConnected = false
+    @Volatile private var isConnected = false
+    private val connectionLock = Any()
+    @Volatile private var closeRequested = false
+    private val hostPingTracker = HostPingTracker()
 
     // Callback includes actual frame size (may differ from buffer.size due to pooling),
     // receive timestamp, and whether the frame can restart HEVC decoding.
@@ -37,6 +41,12 @@ class StreamClient(
     /** Logical desktop size behind the stream. Display only; never size the decoder from it. */
     var onDesktopSize: ((Int, Int) -> Unit)? = null
     var onStats: ((Double, Double) -> Unit)? = null
+
+    /** Display state is independent of video activity; the host may stream a static desktop. */
+    var onHostDisplayState: ((Boolean) -> Unit)? = null
+
+    /** Monotonic receive time of a valid recent pong. */
+    var onHostReply: ((Long) -> Unit)? = null
 
     /** Invoked when the server confirms the stream codec (true = HEVC). */
     var onCodecSelected: ((Boolean) -> Unit)? = null
@@ -121,19 +131,20 @@ class StreamClient(
     suspend fun connect() =
         withContext(Dispatchers.IO) {
             try {
-                socket =
-                    Socket(host, port).apply {
-                        tcpNoDelay = true
-                    }
-                inputStream = DataInputStream(java.io.BufferedInputStream(socket?.getInputStream(), 65536))
-                outputStream = java.io.DataOutputStream(socket?.getOutputStream())
+                val s = Socket()
+                if (!adoptSocket(s)) return@withContext
+                s.tcpNoDelay = true
+                s.connect(java.net.InetSocketAddress(host, port), 5000)
+                inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
+                outputStream = java.io.DataOutputStream(s.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseDesktopGeometrySupport() // Likewise
+                advertiseHostDisplayStateSupport()
                 advertiseFrameMetadataSupport()
-                isConnected = true
+                if (!activateConnection()) return@withContext
                 lastKeyframeReceivedNs = 0L
                 synchronized(keyframeRequestLock) {
                     lastKeyframeRequestNs = 0L
@@ -147,6 +158,29 @@ class StreamClient(
                 Log.e(TAG, "❌ Connection error", e)
                 onConnectionStatus?.invoke(false)
                 cleanup()
+            }
+        }
+
+    /** A StreamClient is one-use: Stop also closes sockets created by a late connect attempt. */
+    private fun adoptSocket(candidate: Socket): Boolean =
+        synchronized(connectionLock) {
+            if (closeRequested) {
+                candidate.close()
+                false
+            } else {
+                socket = candidate
+                true
+            }
+        }
+
+    private fun activateConnection(): Boolean =
+        synchronized(connectionLock) {
+            if (closeRequested) {
+                cleanup()
+                false
+            } else {
+                isConnected = true
+                true
             }
         }
 
@@ -180,9 +214,12 @@ class StreamClient(
      * may take a route that silently drops LAN traffic; binding to the WIFI
      * Network explicitly avoids that.
      */
-    private fun openWirelessSocket(): Socket {
+    private fun openWirelessSocket(streamingConnection: Boolean = false): Socket {
+        val sock = Socket()
         try {
-            val sock = Socket()
+            if (streamingConnection && !adoptSocket(sock)) {
+                throw WirelessConnectError.NetworkUnreachable
+            }
             sock.tcpNoDelay = true
             val cm = context.getSystemService(ConnectivityManager::class.java)
             val wifiNetwork =
@@ -200,9 +237,11 @@ class StreamClient(
             sock.connect(java.net.InetSocketAddress(host, port), 5000)
             return sock
         } catch (e: java.net.SocketTimeoutException) {
+            sock.close()
             Log.e(TAG, "openWirelessSocket: TCP connect timeout to $host:$port (5s)")
             throw WirelessConnectError.NetworkUnreachable
         } catch (e: IOException) {
+            sock.close()
             Log.e(TAG, "openWirelessSocket: TCP connect failed to $host:$port: ${e.javaClass.simpleName}: ${e.message}")
             throw WirelessConnectError.NetworkUnreachable
         }
@@ -294,88 +333,68 @@ class StreamClient(
         token: ByteArray,
         deviceName: String,
     ) = withContext(Dispatchers.IO) {
-        Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName, token bytes=${token.size})")
-
-        val s = openWirelessSocket()
-        Log.i(
-            TAG,
-            "connectWireless: TCP connected, sending handshake (${37 + deviceName.toByteArray().size} bytes)",
-        )
-
-        val request = AuthHandshake.encodeRequest(token, deviceName)
         try {
-            s.getOutputStream().write(request)
-            s.getOutputStream().flush()
-        } catch (e: IOException) {
-            try {
-                s.close()
-            } catch (_: IOException) {
-            }
-            throw WirelessConnectError.NetworkUnreachable
-        }
+            Log.i(TAG, "connectWireless: trying $host:$port (device=$deviceName, token bytes=${token.size})")
 
-        val responseBuf = ByteArray(5)
-        var read = 0
-        try {
-            while (read < 5) {
-                val r = s.getInputStream().read(responseBuf, read, 5 - read)
-                if (r <= 0) break
-                read += r
-            }
-        } catch (e: IOException) {
-            try {
-                s.close()
-            } catch (_: IOException) {
-            }
-            throw WirelessConnectError.NetworkUnreachable
-        }
-        if (read != 5) {
-            try {
-                s.close()
-            } catch (_: IOException) {
-            }
-            throw WirelessConnectError.ProtocolError
-        }
+            if (closeRequested) return@withContext
 
-        val status =
-            AuthHandshake.parseResponse(responseBuf) ?: run {
-                try {
-                    s.close()
-                } catch (_: IOException) {
+            val s = openWirelessSocket(streamingConnection = true)
+            Log.i(
+                TAG,
+                "connectWireless: TCP connected, sending handshake (${37 + deviceName.toByteArray().size} bytes)",
+            )
+
+            val request = AuthHandshake.encodeRequest(token, deviceName)
+            try {
+                s.getOutputStream().write(request)
+                s.getOutputStream().flush()
+            } catch (e: IOException) {
+                throw WirelessConnectError.NetworkUnreachable
+            }
+
+            val responseBuf = ByteArray(5)
+            var read = 0
+            try {
+                while (read < 5) {
+                    val r = s.getInputStream().read(responseBuf, read, 5 - read)
+                    if (r <= 0) break
+                    read += r
                 }
+            } catch (e: IOException) {
+                throw WirelessConnectError.NetworkUnreachable
+            }
+            if (read != 5) {
                 throw WirelessConnectError.ProtocolError
             }
-        Log.i(TAG, "connectWireless: handshake response status=$status")
-        when (status) {
-            AuthHandshake.ResponseStatus.OK -> {
-                socket = s
-                inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
-                outputStream = java.io.DataOutputStream(s.getOutputStream())
-                streamCodecIsHevc = true
-                codecNegotiated = false
-                advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
-                advertiseDecoderLimits() // Also before type 8, for the same reason
-                advertiseDesktopGeometrySupport() // Likewise
-                advertiseFrameMetadataSupport()
-                isConnected = true
-                diagLog("Wireless connected to $host:$port")
-                onConnectionStatus?.invoke(true)
-                receiveData()
-            }
-            AuthHandshake.ResponseStatus.INVALID_TOKEN -> {
-                try {
-                    s.close()
-                } catch (_: IOException) {
+
+            val status =
+                AuthHandshake.parseResponse(responseBuf) ?: throw WirelessConnectError.ProtocolError
+            Log.i(TAG, "connectWireless: handshake response status=$status")
+            when (status) {
+                AuthHandshake.ResponseStatus.OK -> {
+                    inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
+                    outputStream = java.io.DataOutputStream(s.getOutputStream())
+                    streamCodecIsHevc = true
+                    codecNegotiated = false
+                    advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
+                    advertiseDecoderLimits() // Also before type 8, for the same reason
+                    advertiseDesktopGeometrySupport() // Likewise
+                    advertiseHostDisplayStateSupport()
+                    advertiseFrameMetadataSupport()
+                    if (!activateConnection()) return@withContext
+                    diagLog("Wireless connected to $host:$port")
+                    onConnectionStatus?.invoke(true)
+                    receiveData()
                 }
-                throw WirelessConnectError.TokenRejected
-            }
-            else -> {
-                try {
-                    s.close()
-                } catch (_: IOException) {
+                AuthHandshake.ResponseStatus.INVALID_TOKEN -> {
+                    throw WirelessConnectError.TokenRejected
                 }
-                throw WirelessConnectError.ProtocolError
+                else -> {
+                    throw WirelessConnectError.ProtocolError
+                }
             }
+        } finally {
+            cleanup()
         }
     }
 
@@ -392,6 +411,14 @@ class StreamClient(
             out.writeByte(MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA)
             out.flush()
             diagLog("Advertised frame metadata support")
+        }
+    }
+
+    private fun advertiseHostDisplayStateSupport() {
+        outputStream?.let { out ->
+            out.writeByte(HostDisplayStateMessage.CLIENT_SUPPORTS_HOST_DISPLAY_STATE)
+            out.flush()
+            diagLog("Advertised host display-state support")
         }
     }
 
@@ -413,21 +440,27 @@ class StreamClient(
             panel?.let { CodecCapabilities.maxStreamSize(mime, it.width, it.height, CodecCapabilities.REFERENCE_FPS) }
                 ?: CodecCapabilities.nominalMaxDecodeSize(mime)
                 ?: return
-        val (maxW, maxH) = limit
-        val w = maxW.coerceAtMost(16383)
-        val h = maxH.coerceAtMost(16383)
-        if (w < 256 || h < 256) return
+        val payload = encodeDecoderLimitPayload(limit.first, limit.second) ?: return
         outputStream?.let { out ->
             out.writeByte(MESSAGE_CLIENT_DECODER_LIMITS)
-            // 7 data bits per byte with the high bit always set: an old Mac
-            // skips unknown types one byte at a time, so payload bytes must
-            // never collide with real message-type values.
-            out.writeByte(0x80 or ((w shr 7) and 0x7F))
-            out.writeByte(0x80 or (w and 0x7F))
-            out.writeByte(0x80 or ((h shr 7) and 0x7F))
-            out.writeByte(0x80 or (h and 0x7F))
+            out.write(payload)
             out.flush()
-            diagLog("Advertised stream limit ${w}x$h for $mime (panel=$panel)")
+            diagLog("Advertised stream limit ${limit.first}x${limit.second} for $mime (panel=$panel)")
+
+            // A separate, capability-checked limit avoids treating the panel's
+            // 60 FPS dimensions as the decoder's entire throughput budget.
+            // Never substitute nominal dimensions when the 120 FPS query fails.
+            val highRateLimit =
+                panel?.let {
+                    CodecCapabilities.maxStreamSize(mime, it.width, it.height, CodecCapabilities.HIGH_REFRESH_FPS)
+                }
+            val highRatePayload = highRateLimit?.let { encodeDecoderLimitPayload(it.first, it.second) }
+            if (highRatePayload != null) {
+                out.writeByte(MESSAGE_CLIENT_DECODER_LIMITS_120)
+                out.write(highRatePayload)
+                out.flush()
+                diagLog("Advertised 120 FPS stream limit ${highRateLimit.first}x${highRateLimit.second} for $mime")
+            }
         }
     }
 
@@ -464,8 +497,17 @@ class StreamClient(
                             val buf = ByteArray(8)
                             input.readFully(buf)
                             val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
-                            val rtt = (System.nanoTime() - sentTime) / 1_000_000.0 // ms
-                            onLatencyMeasured?.invoke(rtt)
+                            val receivedAtMs = SystemClock.elapsedRealtime()
+                            if (hostPingTracker.receive(sentTime, receivedAtMs)) {
+                                onHostReply?.invoke(receivedAtMs)
+                                val rtt = (System.nanoTime() - sentTime) / 1_000_000.0 // ms
+                                onLatencyMeasured?.invoke(rtt)
+                            }
+                        }
+
+                        HostDisplayStateMessage.SERVER_HOST_DISPLAY_STATE -> {
+                            val awake = HostDisplayStateMessage.readAwake(input)
+                            onHostDisplayState?.invoke(awake)
                         }
 
                         MESSAGE_DESKTOP_GEOMETRY -> {
@@ -584,15 +626,18 @@ class StreamClient(
     fun sendPing() {
         if (!isConnected) return
         touchScope.launch {
+            val timestamp = System.nanoTime()
             try {
                 socket?.getOutputStream()?.let { out ->
                     val buffer = ByteBuffer.allocate(9).order(ByteOrder.LITTLE_ENDIAN)
                     buffer.put(4.toByte()) // Type 4: ping
-                    buffer.putLong(System.nanoTime())
+                    buffer.putLong(timestamp)
+                    hostPingTracker.sent(timestamp, SystemClock.elapsedRealtime())
                     out.write(buffer.array())
                     out.flush()
                 }
             } catch (_: Exception) {
+                hostPingTracker.discard(timestamp)
             }
         }
     }
@@ -683,13 +728,21 @@ class StreamClient(
     }
 
     fun disconnect() {
-        isConnected = false
+        synchronized(connectionLock) {
+            closeRequested = true
+            isConnected = false
+        }
         cleanup()
         onConnectionStatus?.invoke(false)
         Log.d(TAG, "Disconnected")
     }
 
     private fun cleanup() {
+        synchronized(connectionLock) {
+            closeRequested = true
+            isConnected = false
+        }
+        hostPingTracker.clear()
         try {
             outputStream?.close()
             inputStream?.close()
@@ -735,6 +788,7 @@ class StreamClient(
         private const val MESSAGE_CLIENT_DECODER_LIMITS = 11
         private const val MESSAGE_CLIENT_SUPPORTS_DESKTOP_GEOMETRY = 12
         private const val MESSAGE_DESKTOP_GEOMETRY = 13
+        private const val MESSAGE_CLIENT_DECODER_LIMITS_120 = 14
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

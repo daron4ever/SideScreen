@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Preserve decoder-supported native tablet resolutions to avoid unnecessary scaling and softened text; retain aligned fallback for unsupported sizes.
+- Refresh screen-recording permission on app activation and request consent only
+  through an explicit user action; stop capture recovery on authorization denial.
+- **Automatic screen sleep while streaming.** The Mac now follows its configured display timeout. With both apps updated, the tablet stays awake while the Mac display is active and allows its own screen timeout when the Mac display sleeps or the host stops responding. Capture resumes after Mac wake; the tablet may still require normal wake/unlock and manual reconnection if the connection was lost.
+
+### Added
+- Optional `SIDESCREEN_SIGNING_IDENTITY` for certificate-backed local Mac builds;
+  reject an invalid selection before stopping the app or cleaning build outputs.
+- Optional **Keep tablet charging from Mac** recovery in USB mode. The Mac host binds the tablet selected when enabled, corrects outgoing USB power once per attachment, and verifies incoming power. Recovery stays active when streaming stops, but requires the Mac app to remain open. Unsafe or unsupported states are reported without repeated power-switch attempts.
+- Stream-scoped tablet refresh requests and optional native-resolution decoder negotiation checked at 120 FPS, using the same eligible ordinary hardware decoder profile for capability limits and playback. Add numeric capture/encoder stage counters and retain six capture buffers above 60 Hz after the measured comparison; sustained 120 FPS depends on hardware and workload.
+
 ### Known issue — "Screen & System Audio: Required" after updating (#77, #8, #5)
 The Mac app is ad-hoc signed, so every release has a new code hash. macOS ties the Screen Recording grant to that hash: after an update the toggle in System Settings still shows SideScreen as on, but the app sees the permission as missing, the Status row stays red and Start is disabled. Removing and re-adding the entry in System Settings often does not clear it. Fix, in Terminal:
 

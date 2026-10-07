@@ -59,8 +59,11 @@ enum StatusDetector {
 
     private static var cachedAdbPath: String?
     private static var lastAdbCacheCheck: Date = .distantPast
+    private static let adbCacheLock = NSLock()
 
-    private static func adbExecutablePath() -> String? {
+    static func adbExecutablePath() -> String? {
+        adbCacheLock.lock()
+        defer { adbCacheLock.unlock() }
         // Re-resolve every 5 s so install/uninstall is reflected.
         if let cached = cachedAdbPath, Date().timeIntervalSince(lastAdbCacheCheck) < 5.0 {
             return cached

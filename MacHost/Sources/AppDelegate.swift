@@ -58,12 +58,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// shows "just now" while connected and freezes at the disconnect moment afterward.
     private var currentWirelessDevice: String?
     private var cancellables = Set<AnyCancellable>()
-    private var permissionCheckTimer: Timer?
+    @MainActor private lazy var screenRecordingPermission = ScreenRecordingPermission(
+        preflight: { CGPreflightScreenCaptureAccess() },
+        requestAccess: { CGRequestScreenCaptureAccess() }
+    )
     private var statusRefreshTimer: Timer?
+    @MainActor private var usbChargingIsAwake = true
+    @MainActor private var hostDisplaySleepState = HostDisplaySleepState(
+        displaysAwake: CGDisplayIsAsleep(CGMainDisplayID()) == 0
+    )
+    @MainActor private lazy var usbChargingRecovery = USBChargingRecovery(
+        adbPath: { StatusDetector.adbExecutablePath() },
+        onStatus: { [weak self] status in
+            guard let self, self.settings.usbChargingStatus != status else { return }
+            self.settings.usbChargingStatus = status
+        },
+        onSelection: { [weak self] serial in
+            guard let self, self.settings.usbChargingDeviceSerial != serial else { return }
+            self.settings.usbChargingDeviceSerial = serial
+        },
+        onBridgeStatus: { [weak self] configured in
+            guard let self, self.settings.adbReverseConfigured != configured else { return }
+            self.settings.adbReverseConfigured = configured
+        },
+        bridgeAllowed: { [weak self] port in
+            guard let self else { return false }
+            return self.usbChargingIsAwake && self.settings.connectionMode == .usb
+                && (self.settings.isRunning || self.isStartingServer)
+                && self.settings.port == port
+        }
+    )
     /// Reentrancy latch for startServer() — a second Start (double-clicked menu
     /// item, auto-start racing a manual click) must not build a second virtual
     /// display / server. Main-actor confined.
     private var isStartingServer = false
+    private var serverGeneration: UInt64 = 0
     /// The effective refresh rate the running pipeline was built with — lets
     /// the refresh-rate observer skip restarts that would change nothing.
     private var lastAppliedRefreshRate: Int?
@@ -80,6 +109,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Setup settings observers
         setupSettingsObservers()
+        setupHostPowerLifecycle()
 
         // Check permissions
         Task {
@@ -134,6 +164,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func refreshStatusIndicators() {
+        refreshUSBChargingPolicy()
         settings.adbInstalled = StatusDetector.adbInstalled()
         settings.wifiConnected = StatusDetector.wifiReachable()
         settings.listeningAddress = LANAddressResolver.primaryIPv4()
@@ -168,7 +199,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let isConnected = !devices.isEmpty
 
                 self.settings.usbDeviceConnected = isConnected
-                self.settings.adbReverseConfigured = reverseOK
+                if !self.settings.usbChargingEnabled {
+                    self.settings.adbReverseConfigured = reverseOK
+                }
 
                 // Self-healing USB bridge (level-triggered, not edge-triggered):
                 // whenever we are in USB mode with the server running and a
@@ -179,6 +212,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if self.settings.connectionMode == .usb
                     && isConnected
                     && self.settings.isRunning
+                    && !self.settings.usbChargingEnabled
                     && !reverseOK {
                     debugLog("🔌 USB bridge missing while running — (re)establishing adb reverse")
                     Task { await self.setupADBReverse() }
@@ -189,6 +223,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func handleConnectionModeChange(to mode: ConnectionMode) async {
+        usbChargingRecovery.invalidate()
+        refreshUSBChargingPolicy()
         debugLog("Connection mode changed to: \(mode.rawValue)")
         // Disconnect any active client immediately (per spec §6 / fix #2).
         let wasRunning = settings.isRunning
@@ -204,10 +240,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Check permissions on demand (called when settings window opens or manually)
-    func refreshPermissions() {
-        Task {
-            await checkPermissions()
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Task { await checkPermissions() }
+    }
+
+    @MainActor
+    func requestScreenRecordingPermission() {
+        settings.hasScreenRecordingPermission = screenRecordingPermission.request()
+        if !settings.hasScreenRecordingPermission {
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
         }
     }
 
@@ -263,8 +304,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .dropFirst()
             .sink { [weak self] mode in
                 guard let self = self else { return }
+                MainActor.assumeIsolated {
+                    self.usbChargingRecovery.invalidate()
+                    self.usbChargingRecovery.configure(
+                        enabled: self.settings.usbChargingEnabled,
+                        selectedSerial: self.settings.usbChargingDeviceSerial,
+                        eligible: mode == .usb && self.usbChargingIsAwake
+                    )
+                }
                 Task { @MainActor in
                     await self.handleConnectionModeChange(to: mode)
+                }
+            }
+            .store(in: &cancellables)
+
+        Publishers.CombineLatest(settings.$usbChargingEnabled, settings.$usbChargingDeviceSerial)
+            .dropFirst()
+            .removeDuplicates { $0.0 == $1.0 && $0.1 == $1.1 }
+            .sink { [weak self] enabled, serial in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.usbChargingRecovery.configure(
+                        enabled: enabled,
+                        selectedSerial: serial,
+                        eligible: self.settings.connectionMode == .usb && self.usbChargingIsAwake
+                    )
+                    self.usbChargingRecovery.poll(
+                        bridgePort: self.settings.isRunning ? self.settings.port : nil
+                    )
                 }
             }
             .store(in: &cancellables)
@@ -337,7 +404,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
     }
 
-    @objc private func toggleServerFromMenu() {
+    @MainActor @objc private func toggleServerFromMenu() {
         if settings.isRunning {
             stopServer()
         } else {
@@ -361,12 +428,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindow = SettingsWindowController(settings: settings)
 
         settings.onToggleServer = { [weak self] in
-            guard let self else { return }
-            if self.settings.isRunning {
-                self.stopServer()
-            } else {
-                Task { [weak self] in
-                    await self?.startServer()
+            Task { @MainActor in
+                guard let self else { return }
+                if self.settings.isRunning {
+                    self.stopServer()
+                } else {
+                    await self.startServer()
                 }
             }
         }
@@ -378,30 +445,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func checkPermissions() async {
-        let version = ProcessInfo.processInfo.operatingSystemVersion
-        debugLog("checkPermissions — macOS \(version.majorVersion).\(version.minorVersion).\(version.patchVersion)")
-
-        // Check Screen Recording permission using CoreGraphics API
-        let hasScreenCapture = CGPreflightScreenCaptureAccess()
         await MainActor.run {
-            settings.hasScreenRecordingPermission = hasScreenCapture
-        }
-        if hasScreenCapture {
-            debugLog("Screen recording permission granted (CGPreflight)")
-
-            // On macOS 26+, also verify ScreenCaptureKit is actually functional
-            if version.majorVersion >= 26 {
-                do {
-                    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-                    debugLog("SCShareableContent verification OK — \(content.displays.count) displays found")
-                } catch {
-                    debugLog("WARNING: CGPreflight OK but SCShareableContent failed on macOS 26: \(error.localizedDescription)")
-                    debugLog("CGDisplayStream fallback will likely activate at capture time")
-                }
-            }
-        } else {
-            debugLog("Screen recording permission not granted yet")
-            CGRequestScreenCaptureAccess()
+            settings.hasScreenRecordingPermission = screenRecordingPermission.refresh()
         }
 
         // Check Accessibility permission (required for touch/mouse injection)
@@ -432,96 +477,82 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Setup ADB reverse port forwarding for USB connection
+    @MainActor
+    private func setupHostPowerLifecycle() {
+        let center = NSWorkspace.shared.notificationCenter
+        center.publisher(for: NSWorkspace.willSleepNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.usbChargingIsAwake = false
+                    self.hostDisplaySleepState.systemAwake = false
+                    self.hostDisplaySleepState.displaysAwake = false
+                    self.applyHostDisplaySleepState()
+                    self.usbChargingRecovery.invalidate()
+                    self.refreshUSBChargingPolicy()
+                }
+            }
+            .store(in: &cancellables)
+        center.publisher(for: NSWorkspace.didWakeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.usbChargingIsAwake = true
+                    self.hostDisplaySleepState.systemAwake = true
+                    self.hostDisplaySleepState.displaysAwake = self.hostDisplaySleepState.displaysAwake
+                        || CGDisplayIsAsleep(CGMainDisplayID()) == 0
+                    self.applyHostDisplaySleepState()
+                    self.refreshUSBChargingPolicy()
+                }
+            }
+            .store(in: &cancellables)
+        for (notification, awake) in [
+            (NSWorkspace.screensDidSleepNotification, false),
+            (NSWorkspace.screensDidWakeNotification, true)
+        ] {
+            center.publisher(for: notification)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        self.hostDisplaySleepState.displaysAwake = awake
+                        self.applyHostDisplaySleepState()
+                    }
+                }
+                .store(in: &cancellables)
+        }
+    }
+
+    @MainActor
+    private func applyHostDisplaySleepState() {
+        let awake = hostDisplaySleepState.isAwake
+        streamingServer?.setHostDisplayAwake(awake)
+        screenCapture?.setHostDisplayAwake(awake)
+    }
+
+    @MainActor
+    private func refreshUSBChargingPolicy() {
+        usbChargingRecovery.configure(
+            enabled: settings.usbChargingEnabled,
+            selectedSerial: settings.usbChargingDeviceSerial,
+            eligible: settings.connectionMode == .usb && usbChargingIsAwake
+        )
+        usbChargingRecovery.poll(bridgePort: settings.isRunning ? settings.port : nil)
+    }
+
+    /// USB bridge setup shares the charging command owner so the two cannot race.
+    @MainActor
     func setupADBReverse() async {
-        let port = settings.port
-        print("🔌 Setting up ADB reverse for port \(port)...")
-        debugLog("🔌 setupADBReverse() invoked for port \(port)...")
-
-        await Task.detached(priority: .utility) {
-            // Try common adb paths
-            let adbPaths = [
-                "/usr/local/bin/adb",
-                "/opt/homebrew/bin/adb",
-                "~/Library/Android/sdk/platform-tools/adb",
-                "/Users/\(NSUserName())/Library/Android/sdk/platform-tools/adb"
-            ]
-
-            var adbPath: String?
-            for path in adbPaths {
-                let expandedPath = NSString(string: path).expandingTildeInPath
-                if FileManager.default.fileExists(atPath: expandedPath) {
-                    adbPath = expandedPath
-                    break
-                }
-            }
-
-            // Also try 'which adb' to find it in PATH
-            if adbPath == nil {
-                let whichProcess = Process()
-                whichProcess.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-                whichProcess.arguments = ["adb"]
-                let whichPipe = Pipe()
-                whichProcess.standardOutput = whichPipe
-                whichProcess.standardError = FileHandle.nullDevice
-
-                do {
-                    try whichProcess.run()
-                    whichProcess.waitUntilExit()
-                    let data = whichPipe.fileHandleForReading.readDataToEndOfFile()
-                    if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                       !path.isEmpty {
-                        adbPath = path
-                    }
-                } catch {
-                    // Ignore
-                }
-            }
-
-            guard let finalAdbPath = adbPath else {
-                print("⚠️  ADB not found - USB connection may not work")
-                print("💡 Install Android SDK or run manually: adb reverse tcp:\(port) tcp:\(port)")
-                return
-            }
-
-            print("📱 Found ADB at: \(finalAdbPath)")
-
-            // Retry adb reverse up to 3 times — handles first-install authorization delay
-            for attempt in 1...3 {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: finalAdbPath)
-                process.arguments = ["reverse", "tcp:\(port)", "tcp:\(port)"]
-
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = pipe
-
-                do {
-                    try process.run()
-                    process.waitUntilExit()
-
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let output = String(data: data, encoding: .utf8) ?? ""
-
-                    if process.terminationStatus == 0 {
-                        print("✅ ADB reverse setup successful: tcp:\(port) -> tcp:\(port)")
-                        return
-                    } else {
-                        print("⚠️  ADB reverse attempt \(attempt)/3 failed: \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
-                        if attempt < 3 {
-                            try? await Task.sleep(nanoseconds: 1_000_000_000)
-                        }
-                    }
-                } catch {
-                    print("⚠️  Failed to run ADB (attempt \(attempt)/3): \(error.localizedDescription)")
-                    if attempt < 3 {
-                        try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    }
-                }
-            }
-
-            print("💡 Make sure Android device is connected via USB with debugging enabled")
-        }.value
+        guard settings.connectionMode == .usb, usbChargingIsAwake else { return }
+        usbChargingRecovery.configure(
+            enabled: settings.usbChargingEnabled,
+            selectedSerial: settings.usbChargingDeviceSerial,
+            eligible: true
+        )
+        let configured = await usbChargingRecovery.ensureBridge(port: settings.port)
+        debugLog(configured ? "USB bridge configured" : "USB bridge unavailable")
     }
 
     @MainActor
@@ -547,19 +578,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @MainActor
     func startServer() async {
-        let canStart = await MainActor.run { () -> Bool in
-            guard !isStartingServer, !settings.isRunning else { return false }
-            isStartingServer = true
-            return true
-        }
-        guard canStart else {
+        guard !isStartingServer, !settings.isRunning else {
             debugLog("startServer() ignored — already starting or already running")
             return
         }
+        isStartingServer = true
+        serverGeneration &+= 1
+        let generation = serverGeneration
         defer {
-            Task { @MainActor [weak self] in self?.isStartingServer = false }
+            if serverGeneration == generation { isStartingServer = false }
         }
+        await checkPermissions()
+        guard serverGeneration == generation else { return }
         debugLog("🚀 startServer() invoked. Check permission: \(settings.hasScreenRecordingPermission)")
         guard settings.hasScreenRecordingPermission else {
             debugLog("❌ startServer aborted: Missing Screen Recording permission")
@@ -586,9 +618,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // Not critical - continue anyway
             }
 
-            await MainActor.run {
-                settings.displayCreated = true
-            }
+            settings.displayCreated = true
 
             // Run ADB setup (USB only) and display init wait in parallel.
             // For wireless mode, skip ADB entirely — the auth handshake gates LAN connections instead.
@@ -600,6 +630,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 group.addTask { try? await Task.sleep(nanoseconds: 500_000_000) }
             }
+            guard serverGeneration == generation else { return }
 
             virtualDisplayManager?.restoreDisplayPosition()
 
@@ -619,26 +650,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     userInfo: [NSLocalizedDescriptionKey: "The virtual display was created without a display ID."]
                 )
             }
-            screenCapture = try await ScreenCapture()
-            screenCapture?.onCaptureMethodChanged = { [weak self] method in
-                guard let self = self else { return }
-                debugLog("Capture method: \(method)")
+            let newCapture = try await ScreenCapture()
+            guard serverGeneration == generation else { return }
+            screenCapture = newCapture
+            if let capture = screenCapture {
+                capture.onPermissionDenied = { [weak self, weak capture] in
+                    Task { @MainActor in
+                        guard let self, let capture, self.serverGeneration == generation,
+                              self.screenCapture === capture else { return }
+                        self.settings.hasScreenRecordingPermission = false
+                        self.stopServer()
+                        self.showSettings()
+                    }
+                }
+            }
+            newCapture.onCaptureMethodChanged = { [weak self, weak newCapture] method in
                 Task { @MainActor in
+                    guard let self, let newCapture, self.serverGeneration == generation,
+                          self.screenCapture === newCapture else { return }
+                    debugLog("Capture method: \(method)")
                     self.settings.captureMethod = method
                 }
             }
             lastAppliedRefreshRate = settings.effectiveRefreshRate
-            try await screenCapture?.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
+            try await newCapture.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
+            guard serverGeneration == generation else {
+                newCapture.stopStreaming()
+                return
+            }
 
             // Setup server
-            streamingServer = StreamingServer(port: settings.port)
+            screenCapture?.setHostDisplayAwake(hostDisplaySleepState.isAwake)
+            streamingServer = StreamingServer(
+                port: settings.port, hostDisplayAwake: hostDisplaySleepState.isAwake
+            )
             streamingServer?.touchEnabled = settings.touchEnabled
             if settings.connectionMode == .wireless {
                 streamingServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
                 configurePairingCode(on: streamingServer)
-                streamingServer?.onWirelessClientPaired = { [weak self] deviceName in
-                    guard let self = self else { return }
+                streamingServer?.onWirelessClientPaired = { [weak self, weak newCapture] deviceName in
                     Task { @MainActor in
+                        guard let self, let newCapture, self.serverGeneration == generation,
+                              self.screenCapture === newCapture else { return }
                         self.currentWirelessDevice = deviceName
                         self.settings.currentWirelessDevice = deviceName
                         self.pairedDeviceStore.upsert(name: deviceName, lastConnected: Date())
@@ -652,33 +705,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let initialEncode = ScreenCapture.physicalSize(for: displayID)
             streamingServer?.setDesktopSize(width: size.width, height: size.height)
             streamingServer?.setDisplaySize(width: initialEncode.width, height: initialEncode.height, rotation: settings.rotation, flipHorizontal: settings.flipHorizontal, flipVertical: settings.flipVertical)
-            streamingServer?.onClientConnected = { [weak self] in
-                guard let self = self else { return }
-                self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
+            streamingServer?.onClientConnected = { [weak self, weak newCapture] in
+                newCapture?.requestKeyframeOrReplayCachedFrame(force: true)
                 Task { @MainActor in
+                    guard let self, let newCapture, self.serverGeneration == generation,
+                          self.screenCapture === newCapture else { return }
                     self.settings.clientConnected = true
                 }
             }
             // Runs synchronously on the server's network queue BEFORE the
             // display config is sent, so the config below carries the right
             // dimensions for the negotiated codec.
-            streamingServer?.onCodecNegotiated = { [weak self] codec in
-                guard let self = self, let capture = self.screenCapture else { return }
-                capture.negotiate(codec: codec, clientLimit: self.streamingServer?.clientDecodeLimits)
-                let enc = capture.encodeSize(for: codec)
-                // Whatever the codec negotiation settled on, this is what the
-                // stream's SPS will carry, so it is what the client must size
-                // its decoder for.
-                self.streamingServer?.setDesktopSize(width: size.width, height: size.height)
-                self.streamingServer?.setDisplaySize(width: enc.width, height: enc.height, rotation: self.settings.rotation, flipHorizontal: self.settings.flipHorizontal, flipVertical: self.settings.flipVertical)
+            streamingServer?.onCodecNegotiated = { [weak self, weak newCapture] codec in
+                // Capture lifecycle state belongs to the main actor; protocol
+                // startup waits here so config still follows negotiation.
+                DispatchQueue.main.sync {
+                    MainActor.assumeIsolated {
+                        guard let self, let newCapture, self.serverGeneration == generation,
+                              self.screenCapture === newCapture else { return }
+                        newCapture.negotiate(
+                            codec: codec,
+                            clientLimit: self.streamingServer?.clientDecodeLimits,
+                            clientLimit120: self.streamingServer?.clientDecodeLimits120
+                        )
+                        let enc = newCapture.encodeSize(for: codec)
+                        self.streamingServer?.setDesktopSize(width: size.width, height: size.height)
+                        self.streamingServer?.setDisplaySize(width: enc.width, height: enc.height, rotation: self.settings.rotation, flipHorizontal: self.settings.flipHorizontal, flipVertical: self.settings.flipVertical)
+                    }
+                }
             }
-            streamingServer?.onKeyframeRequested = { [weak self] force in
-                self?.screenCapture?.requestKeyframeOrReplayCachedFrame(force: force)
+            streamingServer?.onKeyframeRequested = { [weak newCapture] force in
+                newCapture?.requestKeyframeOrReplayCachedFrame(force: force)
             }
 
-            streamingServer?.onClientDisconnected = { [weak self] in
-                guard let self = self else { return }
+            streamingServer?.onClientDisconnected = { [weak self, weak newCapture] in
                 Task { @MainActor in
+                    guard let self, let newCapture, self.serverGeneration == generation,
+                          self.screenCapture === newCapture else { return }
                     self.settings.clientConnected = false
                     // Final lastConnected snapshot at the disconnect moment, then
                     // freeze (currentWirelessDevice = nil stops the rolling update
@@ -691,15 +754,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            streamingServer?.onTouchEvent = { [weak self] x, y, action, pointerCount, x2, y2 in
-                self?.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2)
+            streamingServer?.onTouchEvent = { [weak self, weak newCapture] x, y, action, pointerCount, x2, y2 in
+                // StreamingServer already delivers touch on the main queue.
+                MainActor.assumeIsolated {
+                    guard let self, let newCapture, self.serverGeneration == generation,
+                          self.screenCapture === newCapture else { return }
+                    self.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2)
+                }
             }
 
-            streamingServer?.onStats = { [weak self] fps, mbps in
-                let captured = self
+            streamingServer?.onStats = { [weak self, weak newCapture] fps, mbps in
                 Task { @MainActor in
-                    captured?.settings.currentFPS = fps
-                    captured?.settings.currentBitrate = mbps
+                    guard let self, let newCapture, self.serverGeneration == generation,
+                          self.screenCapture === newCapture else { return }
+                    self.settings.currentFPS = fps
+                    self.settings.currentBitrate = mbps
                 }
             }
 
@@ -711,6 +780,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 )
             }
             try await server.start()
+            guard serverGeneration == generation else {
+                server.stop()
+                newCapture.stopStreaming()
+                return
+            }
             screenCapture?.startStreaming(
                 to: server,
                 bitrateMbps: settings.effectiveBitrate,
@@ -719,22 +793,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 frameRate: settings.effectiveRefreshRate
             )
 
-            await MainActor.run {
-                settings.isRunning = true
-            }
+            settings.isRunning = true
 
             print("✅ Server started on port \(settings.port)")
         } catch {
+            guard serverGeneration == generation else { return }
             print("❌ Failed to start: \(error)")
-            await MainActor.run {
-                self.tearDownServerResources(saveDisplayPosition: false)
+            self.tearDownServerResources(saveDisplayPosition: false)
 
-                let alert = NSAlert()
-                alert.messageText = "Failed to Start Server"
-                alert.informativeText = error.localizedDescription
-                alert.alertStyle = .critical
-                alert.runModal()
+            if isScreenRecordingPermissionDenied(error) {
+                self.settings.hasScreenRecordingPermission = false
+                self.showSettings()
+                return
             }
+            let alert = NSAlert()
+            alert.messageText = "Failed to Start Server"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .critical
+            alert.runModal()
         }
     }
 
@@ -770,7 +846,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @MainActor
     private func tearDownServerResources(saveDisplayPosition: Bool) {
+        serverGeneration &+= 1
+        isStartingServer = false
         if saveDisplayPosition {
             virtualDisplayManager?.saveDisplayPosition()
         }
@@ -794,6 +873,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.currentBitrate = 0
     }
 
+    @MainActor
     func stopServer() {
         tearDownServerResources(saveDisplayPosition: true)
 
@@ -1192,7 +1272,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         momentumVelocityY = 0
     }
 
+    @MainActor
     func applicationWillTerminate(_ notification: Notification) {
+        statusRefreshTimer?.invalidate()
+        usbChargingRecovery.stop()
         // Stop momentum scrolling
         stopMomentumScroll()
 

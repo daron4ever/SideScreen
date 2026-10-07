@@ -5,6 +5,48 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Resolve an explicitly selected identity before stopping the app or cleaning
+# outputs. Use the certificate hash for signing so duplicate names cannot select
+# a different identity later. Leaving the variable unset preserves ad-hoc builds.
+SIGNING_IDENTITY="-"
+if [ "${SIDESCREEN_SIGNING_IDENTITY+x}" = "x" ]; then
+    if [ -z "$SIDESCREEN_SIGNING_IDENTITY" ]; then
+        echo "Error: SIDESCREEN_SIGNING_IDENTITY must not be empty." >&2
+        exit 1
+    fi
+    if ! SIGNING_IDENTITIES=$(security find-identity -v -p codesigning 2>/dev/null); then
+        echo "Error: Could not check available code-signing identities." >&2
+        exit 1
+    fi
+
+    REQUESTED_HASH=$(printf '%s' "$SIDESCREEN_SIGNING_IDENTITY" | tr '[:lower:]' '[:upper:]')
+    RESOLVED_IDENTITY=""
+    IDENTITY_PATTERN='^[[:space:]]*[0-9]+\)[[:space:]]+([[:xdigit:]]{40})'
+    IDENTITY_PATTERN+='[[:space:]]+"(.*)"[[:space:]]*$'
+    while IFS= read -r identity_line; do
+        if [[ "$identity_line" =~ $IDENTITY_PATTERN ]]; then
+            identity_name="${BASH_REMATCH[2]}"
+            identity_hash=$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:lower:]' '[:upper:]')
+            if [[ "$SIDESCREEN_SIGNING_IDENTITY" == "$identity_name" ||
+                  "$REQUESTED_HASH" == "$identity_hash" ]]; then
+                if [[ -n "$RESOLVED_IDENTITY" && "$RESOLVED_IDENTITY" != "$identity_hash" ]]; then
+                    echo "Error: Signing identity is ambiguous; select its certificate SHA-1." >&2
+                    exit 1
+                fi
+                RESOLVED_IDENTITY="$identity_hash"
+            fi
+        fi
+    done <<< "$SIGNING_IDENTITIES"
+    if [ -z "$RESOLVED_IDENTITY" ]; then
+        echo "Error: Requested code-signing identity is unavailable or invalid." >&2
+        exit 1
+    fi
+    SIGNING_IDENTITY="$RESOLVED_IDENTITY"
+else
+    echo "Warning: Ad-hoc signing may require Screen Recording access again after rebuilding." >&2
+    echo "Set SIDESCREEN_SIGNING_IDENTITY to a valid code-signing identity for stable signing." >&2
+fi
+
 # Read version
 VERSION=$(cat "$ROOT_DIR/VERSION" | tr -d '[:space:]')
 echo "Building version $VERSION..."
@@ -96,9 +138,14 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
 </plist>
 EOF
 
-# Ad-hoc code sign to prevent Gatekeeper "damaged" error
-echo "Code signing (ad-hoc)..."
-codesign --force --deep --sign - --entitlements "$ROOT_DIR/MacHost/SideScreen.entitlements" "$APP_DIR"
+# Code sign using the preflighted identity, or the existing ad-hoc default.
+if [ "$SIGNING_IDENTITY" = "-" ]; then
+    echo "Code signing (ad-hoc)..."
+else
+    echo "Code signing (configured identity)..."
+fi
+codesign --force --deep --sign "$SIGNING_IDENTITY" \
+    --entitlements "$ROOT_DIR/MacHost/SideScreen.entitlements" "$APP_DIR"
 echo "  ✓ App signed"
 
 echo ""
