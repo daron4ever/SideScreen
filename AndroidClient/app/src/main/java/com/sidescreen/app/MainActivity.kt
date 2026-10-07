@@ -86,6 +86,10 @@ class MainActivity : AppCompatActivity() {
     private var checklistRunnable: Runnable? = null
     private var isConnected = false // Track connection state to prevent checklist conflicts
 
+    // Main-thread-only refresh ownership, separate from asynchronous UI status callbacks.
+    private var refreshResumed = false
+    private val refreshRequest = StreamingRefreshRequest()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -316,6 +320,7 @@ class MainActivity : AppCompatActivity() {
                     log("Surface changed: ${width}x$height")
                     currentSurfaceHolder = holder
                     initializeDecoderForCurrentSurface()
+                    updateStreamingRefreshRate()
                 }
 
                 override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -326,6 +331,7 @@ class MainActivity : AppCompatActivity() {
                         videoDecoder = null
                     }
                     currentSurfaceHolder = null
+                    updateStreamingRefreshRate()
                 }
             },
         )
@@ -340,6 +346,7 @@ class MainActivity : AppCompatActivity() {
                     mainDiag("textureAvailable: ${width}x$height")
                     currentTextureSurface = Surface(surface)
                     initializeDecoderForCurrentSurface()
+                    updateStreamingRefreshRate()
                 }
 
                 override fun onSurfaceTextureSizeChanged(
@@ -359,6 +366,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     currentTextureSurface?.release()
                     currentTextureSurface = null
+                    updateStreamingRefreshRate()
                     return true
                 }
 
@@ -1047,7 +1055,7 @@ class MainActivity : AppCompatActivity() {
     /**
      * Wire up all StreamClient callbacks. Used by both USB connect() and wireless connectWireless().
      */
-    private fun setupStreamClientCallbacks() {
+    private fun setupStreamClientCallbacks(refreshAttempt: Long) {
         streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
             val dec = videoDecoder
             if (dec != null) {
@@ -1069,6 +1077,7 @@ class MainActivity : AppCompatActivity() {
 
         streamClient?.onConnectionStatus = { connected ->
             runOnUiThread {
+                updateRefreshConnection(refreshAttempt, connected)
                 isConnected = connected
                 if (connected) {
                     updateStatus("Connected - Streaming active")
@@ -1275,11 +1284,13 @@ class MainActivity : AppCompatActivity() {
         deviceName: String,
         macName: String,
     ) {
+        val refreshAttempt = refreshRequest.beginConnection()
+        updateStreamingRefreshRate()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting wirelessly to $host:$port...")
                 streamClient = StreamClient(host, port, applicationContext)
-                setupStreamClientCallbacks()
+                setupStreamClientCallbacks(refreshAttempt)
                 streamClient?.connectWireless(token, deviceName)
                 // NOTE: onConnectSuccess is fired from the onConnectionStatus(true)
                 // listener (above) right after handshake OK — not here. This line
@@ -1302,6 +1313,8 @@ class MainActivity : AppCompatActivity() {
         host: String,
         port: Int,
     ) {
+        val refreshAttempt = refreshRequest.beginConnection()
+        updateStreamingRefreshRate()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting to $host:$port...")
@@ -1334,6 +1347,7 @@ class MainActivity : AppCompatActivity() {
 
                 streamClient?.onConnectionStatus = { connected ->
                     runOnUiThread {
+                        updateRefreshConnection(refreshAttempt, connected)
                         // Update connection state flag
                         isConnected = connected
 
@@ -1452,6 +1466,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun disconnect() {
+        // Release even if the transport never delivers its disconnect callback.
+        runOnUiThread {
+            refreshRequest.endConnection()
+            updateStreamingRefreshRate()
+        }
         stopPingTimer()
         streamClient?.disconnect()
         // Reset display config so next connect defers decoder init until config arrives
@@ -1580,6 +1599,7 @@ class MainActivity : AppCompatActivity() {
         binding.surfaceView.visibility = View.VISIBLE
         binding.textureView.visibility = if (flipHorizontal || flipVertical) View.VISIBLE else View.GONE
         applyTextureTransform()
+        updateStreamingRefreshRate()
 
         log(
             "🔄 Orientation: ${when (rotation) {
@@ -1620,7 +1640,52 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun updateRefreshConnection(
+        attempt: Long,
+        connected: Boolean,
+    ) {
+        if (isDestroyed) return
+        refreshRequest.updateConnection(attempt, connected)
+        updateStreamingRefreshRate()
+    }
+
+    private fun updateStreamingRefreshRate() {
+        val display = binding.root.display
+        val mode = display?.mode
+        val rates =
+            display?.supportedModes
+                ?.filter { mode != null && it.physicalWidth == mode.physicalWidth && it.physicalHeight == mode.physicalHeight }
+                ?.map { it.refreshRate }
+                .orEmpty()
+        val requested =
+            refreshRequest.preferredRate(
+                resumed = refreshResumed && !isDestroyed,
+                hasSurface = activeVideoSurface() != null,
+                supportedRates = rates,
+            )
+        val attributes = window.attributes
+        if (attributes.preferredRefreshRate == requested) return
+        attributes.preferredRefreshRate = requested
+        window.attributes = attributes
+        mainDiag("Refresh request: hz=$requested")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshResumed = true
+        updateStreamingRefreshRate()
+    }
+
+    override fun onPause() {
+        refreshResumed = false
+        updateStreamingRefreshRate()
+        super.onPause()
+    }
+
     override fun onDestroy() {
+        refreshResumed = false
+        refreshRequest.endConnection()
+        updateStreamingRefreshRate()
         super.onDestroy()
         stopChecklistUpdates()
         cleanup()

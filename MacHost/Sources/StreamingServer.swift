@@ -29,6 +29,8 @@ private enum WireMessage {
     /// only. Sent ONLY to clients that sent clientSupportsDesktopGeometry —
     /// older clients disconnect on unknown message types.
     static let desktopGeometry: UInt8 = 13
+    /// Client→server: same four-byte payload as type 11, checked at 120 FPS.
+    static let clientDecoderLimits120: UInt8 = 14
 }
 
 private extension NWEndpoint {
@@ -225,6 +227,7 @@ class StreamingServer {
     private var clientIsAvcOnly = false
     /// Max decode size reported by the connected client (issue #41).
     private(set) var clientDecodeLimits: (width: Int, height: Int)?
+    private(set) var clientDecodeLimits120: (width: Int, height: Int)?
     /// Set when the client opts in via type 12. Gates desktopGeometry sends.
     private var clientSupportsDesktopGeometry = false
     /// Logical desktop size, reported alongside the encoded size for display.
@@ -334,6 +337,7 @@ class StreamingServer {
         clientSupportsFrameMetadata = false
         clientIsAvcOnly = false
         clientDecodeLimits = nil
+        clientDecodeLimits120 = nil
         clientSupportsDesktopGeometry = false
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
@@ -341,6 +345,7 @@ class StreamingServer {
         droppedFrames = 0
 
         connection?.stateUpdateHandler = { [weak self] state in
+            guard self?.connection === newConnection else { return }
             debugLog("Connection state: \(state)")
             switch state {
             case .ready:
@@ -638,7 +643,7 @@ class StreamingServer {
         }
 
         connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self] data, _, isComplete, error in
-            guard let self = self, self.isReceiving, !self.isStopped else { return }
+            guard let self = self, self.connection === connection, self.isReceiving, !self.isStopped else { return }
 
             if error != nil || isComplete {
                 self.isReceiving = false
@@ -725,7 +730,7 @@ class StreamingServer {
                     debugLog("Client is AVC-only — will negotiate H.264")
                 }
 
-            case WireMessage.clientDecoderLimits:
+            case WireMessage.clientDecoderLimits, WireMessage.clientDecoderLimits120:
                 // Type + 4 payload bytes: [w-hi][w-lo][h-hi][h-lo], 7 data
                 // bits each with the high bit always set (old hosts skip the
                 // payload harmlessly). Sent BEFORE type 8, like type 9.
@@ -733,16 +738,13 @@ class StreamingServer {
 
                 let payload = (1...4).map { inputByte(at: $0) }
                 consumeInputBytes(5)
-                guard payload.allSatisfy({ $0 & 0x80 != 0 }) else {
-                    debugLog("Malformed decoder-limits payload — ignoring")
-                    continue
-                }
-                let w = (Int(payload[0] & 0x7F) << 7) | Int(payload[1] & 0x7F)
-                let h = (Int(payload[2] & 0x7F) << 7) | Int(payload[3] & 0x7F)
-                // Anything below QVGA-ish is a nonsense report — ignore it.
-                if w >= 256 && h >= 256 {
-                    clientDecodeLimits = (w, h)
-                    debugLog("Client decoder limit: \(w)x\(h)")
+                if let limit = CodecLimits.decodeAdvertisedLimit(payload) {
+                    if msgType == WireMessage.clientDecoderLimits120 {
+                        clientDecodeLimits120 = limit
+                    } else {
+                        clientDecodeLimits = limit
+                    }
+                    debugLog("Client decoder limit: \(limit.width)x\(limit.height), referenceFPS=\(msgType == WireMessage.clientDecoderLimits120 ? 120 : 60)")
                     // Arrived after the 100 ms legacy grace already finished
                     // startup (slow link, slow device): re-negotiate now so the
                     // limit still takes effect instead of waiting for the next

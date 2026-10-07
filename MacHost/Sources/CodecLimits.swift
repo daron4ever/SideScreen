@@ -41,6 +41,27 @@ enum CodecLimits {
     /// Frame rate the client measures its advertised limit at (mirrors
     /// CodecCapabilities.REFERENCE_FPS on Android).
     static let clientLimitReferenceFps = 60
+    static let highRefreshReferenceFps = 120
+
+    /// Both wire messages use the same fixed four-byte, high-bit-safe payload.
+    static func decodeAdvertisedLimit(_ payload: [UInt8]) -> (width: Int, height: Int)? {
+        guard payload.count == 4, payload.allSatisfy({ $0 & 0x80 != 0 }) else { return nil }
+        let width = (Int(payload[0] & 0x7F) << 7) | Int(payload[1] & 0x7F)
+        let height = (Int(payload[2] & 0x7F) << 7) | Int(payload[3] & 0x7F)
+        guard width >= 256, height >= 256 else { return nil }
+        return (width, height)
+    }
+
+    static func negotiatedBudget(
+        legacy: (width: Int, height: Int)?,
+        highRefresh: (width: Int, height: Int)?,
+        forFps fps: Int
+    ) -> (width: Int, height: Int)? {
+        if fps == highRefreshReferenceFps, let highRefresh {
+            return highRefresh
+        }
+        return legacy.map { scaleLimit($0, forFps: fps) }
+    }
 
     /// The client's limit is a blocks-per-second budget expressed as a frame
     /// size at `clientLimitReferenceFps`. Streaming faster than that spends the

@@ -8,6 +8,7 @@ class VideoEncoder {
         var pendingForceKeyframe = false
     }
 
+    let stageCounters = FrameStageCounters(stage: .encoder)
     private var compressionSession: VTCompressionSession?
     var onEncodedFrame: ((Data, UInt64, Bool) -> Void)?  // data, timestamp, isKeyframe
     private var width: Int
@@ -143,7 +144,10 @@ class VideoEncoder {
     }
 
     func encode(pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime) {
-        guard let session = compressionSession else { return }
+        guard let session = compressionSession else {
+            stageCounters.record(.missingSession)
+            return
+        }
 
         let duration = CMTime(value: 1, timescale: CMTimeScale(frameRate))
 
@@ -161,7 +165,8 @@ class VideoEncoder {
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
             : nil
 
-        VTCompressionSessionEncodeFrame(
+        stageCounters.record(.submissions)
+        let encodeStatus = VTCompressionSessionEncodeFrame(
             session,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: presentationTimeStamp,
@@ -170,6 +175,9 @@ class VideoEncoder {
             sourceFrameRefcon: refconValue,
             infoFlagsOut: nil
         )
+        if encodeStatus != noErr {
+            stageCounters.record(.submitErrors)
+        }
     }
 
     deinit {
@@ -183,7 +191,13 @@ class VideoEncoder {
 // Static start code to avoid repeated allocations
 private let nalStartCode: [UInt8] = [0, 0, 0, 1]
 
-private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallbackRefCon, sourceFrameRefCon, status, _, sampleBuffer) in
+private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallbackRefCon, sourceFrameRefCon, status, infoFlags, sampleBuffer) in
+    if let refcon = outputCallbackRefCon {
+        let encoder = Unmanaged<VideoEncoder>.fromOpaque(refcon).takeUnretainedValue()
+        encoder.stageCounters.record(.outputCallbacks)
+        if status != noErr { encoder.stageCounters.record(.outputErrors) }
+        if infoFlags.contains(.frameDropped) { encoder.stageCounters.record(.outputDropped) }
+    }
     guard status == noErr,
           let sampleBuffer = sampleBuffer,
           let refcon = outputCallbackRefCon else {
@@ -277,5 +291,6 @@ private let encodingOutputCallback: VTCompressionOutputCallback = { (outputCallb
         offset += Int(nalLength)
     }
 
+    encoder.stageCounters.record(.encoded)
     encoder.onEncodedFrame?(frameData, timestamp, isKeyframe)
 }

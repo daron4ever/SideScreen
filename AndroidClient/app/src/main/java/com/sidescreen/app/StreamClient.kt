@@ -413,21 +413,27 @@ class StreamClient(
             panel?.let { CodecCapabilities.maxStreamSize(mime, it.width, it.height, CodecCapabilities.REFERENCE_FPS) }
                 ?: CodecCapabilities.nominalMaxDecodeSize(mime)
                 ?: return
-        val (maxW, maxH) = limit
-        val w = maxW.coerceAtMost(16383)
-        val h = maxH.coerceAtMost(16383)
-        if (w < 256 || h < 256) return
+        val payload = encodeDecoderLimitPayload(limit.first, limit.second) ?: return
         outputStream?.let { out ->
             out.writeByte(MESSAGE_CLIENT_DECODER_LIMITS)
-            // 7 data bits per byte with the high bit always set: an old Mac
-            // skips unknown types one byte at a time, so payload bytes must
-            // never collide with real message-type values.
-            out.writeByte(0x80 or ((w shr 7) and 0x7F))
-            out.writeByte(0x80 or (w and 0x7F))
-            out.writeByte(0x80 or ((h shr 7) and 0x7F))
-            out.writeByte(0x80 or (h and 0x7F))
+            out.write(payload)
             out.flush()
-            diagLog("Advertised stream limit ${w}x$h for $mime (panel=$panel)")
+            diagLog("Advertised stream limit ${limit.first}x${limit.second} for $mime (panel=$panel)")
+
+            // A separate, capability-checked limit avoids treating the panel's
+            // 60 FPS dimensions as the decoder's entire throughput budget.
+            // Never substitute nominal dimensions when the 120 FPS query fails.
+            val highRateLimit =
+                panel?.let {
+                    CodecCapabilities.maxStreamSize(mime, it.width, it.height, CodecCapabilities.HIGH_REFRESH_FPS)
+                }
+            val highRatePayload = highRateLimit?.let { encodeDecoderLimitPayload(it.first, it.second) }
+            if (highRatePayload != null) {
+                out.writeByte(MESSAGE_CLIENT_DECODER_LIMITS_120)
+                out.write(highRatePayload)
+                out.flush()
+                diagLog("Advertised 120 FPS stream limit ${highRateLimit.first}x${highRateLimit.second} for $mime")
+            }
         }
     }
 
@@ -735,6 +741,7 @@ class StreamClient(
         private const val MESSAGE_CLIENT_DECODER_LIMITS = 11
         private const val MESSAGE_CLIENT_SUPPORTS_DESKTOP_GEOMETRY = 12
         private const val MESSAGE_DESKTOP_GEOMETRY = 13
+        private const val MESSAGE_CLIENT_DECODER_LIMITS_120 = 14
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

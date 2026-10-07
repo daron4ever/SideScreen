@@ -121,6 +121,7 @@ class ScreenCapture {
         )
 
         encodeQueue?.async {
+            encoder.stageCounters.record(.replay)
             encoder.encode(pixelBuffer: cached, presentationTimeStamp: pts)
         }
     }
@@ -141,6 +142,7 @@ class ScreenCapture {
     /// smaller of its panel size and what its decoder can sustain at the panel
     /// refresh rate. Nil for legacy clients that report nothing.
     private var clientDecodeLimit: (width: Int, height: Int)?
+    private var clientDecodeLimit120: (width: Int, height: Int)?
 
     /// Encode dimensions for a codec: physical display pixels, clamped to the
     /// client's reported ceiling when known, else to the conservative AVC floor
@@ -154,8 +156,9 @@ class ScreenCapture {
         let phys = (displayWidth, displayHeight)
         // A reported limit is authoritative for both codecs: it is what the
         // client's own MediaCodec claims it can decode.
-        if let limit = clientDecodeLimit {
-            let budget = CodecLimits.scaleLimit(limit, forFps: refreshRate)
+        if let budget = CodecLimits.negotiatedBudget(
+            legacy: clientDecodeLimit, highRefresh: clientDecodeLimit120, forFps: refreshRate
+        ) {
             return CodecLimits.clampToClientLimit(width: phys.0, height: phys.1, limit: budget)
         }
         switch codec {
@@ -360,7 +363,9 @@ class ScreenCapture {
         // default, so it renders identically everywhere.
         config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         config.showsCursor = true
-        config.queueDepth = 4
+        // Diagnostic: allow more capture buffers at high refresh rates while
+        // VideoToolbox processes previous frames asynchronously.
+        config.queueDepth = fps > 60 ? 6 : 4
         config.capturesAudio = false
         config.backgroundColor = .clear
         config.scalesToFit = false
@@ -379,6 +384,7 @@ class ScreenCapture {
         encodeQueue = queue
         pendingEncodes = 0
         lastPixelBuffer = nil
+        let counters = FrameStageCounters(stage: .capture)
 
         streamOutput?.onFrameReceived = { [weak self] sampleBuffer in
             guard let self = self else { return }
@@ -403,10 +409,12 @@ class ScreenCapture {
             // Backpressure: skip if encode queue already has 2+ frames pending
             let pending = OSAtomicAdd32(0, &self.pendingEncodes)
             if pending >= 2 {
+                counters.record(.callbacks, also: .skipped)
                 return
             }
 
             if let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+                counters.record(.callbacks, also: .images)
                 self.lastPixelBuffer = imageBuffer
                 OSAtomicIncrement32(&self.pendingEncodes)
                 queue.async {
@@ -414,11 +422,14 @@ class ScreenCapture {
                     OSAtomicDecrement32(&self.pendingEncodes)
                 }
             } else if let cached = self.lastPixelBuffer {
+                counters.record(.callbacks, also: .cached)
                 OSAtomicIncrement32(&self.pendingEncodes)
                 queue.async {
                     self.encoder?.encode(pixelBuffer: cached, presentationTimeStamp: pts)
                     OSAtomicDecrement32(&self.pendingEncodes)
                 }
+            } else {
+                counters.record(.callbacks, also: .empty)
             }
         }
     }
@@ -523,6 +534,7 @@ class ScreenCapture {
                         timescale: 1_000_000
                     )
                     self.encodeQueue?.async {
+                        self.encoder?.stageCounters.record(.replay)
                         self.encoder?.encode(pixelBuffer: lastBuffer, presentationTimeStamp: pts)
                     }
                     self.stateLock.withLock { $0.lastFrameTime = DispatchTime.now() }
@@ -705,6 +717,7 @@ class ScreenCapture {
         // tablet even when WindowServer is healthy.
         let streamProps = [CGDisplayStream.showCursor as String: true] as CFDictionary
 
+        let counters = FrameStageCounters(stage: .fallback)
         guard let displayStream = CGDisplayStream(
             dispatchQueueDisplay: displayID,
             outputWidth: width,
@@ -713,7 +726,12 @@ class ScreenCapture {
             properties: streamProps,
             queue: queue,
             handler: { [weak self] _, _, frameSurface, _ in
-                guard let self = self, let surface = frameSurface else { return }
+                guard let self = self else { return }
+                counters.record(.callbacks)
+                guard let surface = frameSurface else {
+                    counters.record(.empty)
+                    return
+                }
 
                 var unmanagedPB: Unmanaged<CVPixelBuffer>?
                 let attrs: [String: Any] = [
@@ -726,7 +744,11 @@ class ScreenCapture {
                     &unmanagedPB
                 )
 
-                guard cvReturn == kCVReturnSuccess, let pb = unmanagedPB?.takeRetainedValue() else { return }
+                guard cvReturn == kCVReturnSuccess, let pb = unmanagedPB?.takeRetainedValue() else {
+                    counters.record(.empty)
+                    return
+                }
+                counters.record(.images)
 
                 // Use CMClock for accurate timestamps instead of raw Mach time
                 let pts = CMClockGetTime(CMClockGetHostTimeClock())
@@ -767,7 +789,11 @@ class ScreenCapture {
     /// client's reported decoder ceiling. Rebuilds the encoder mid-session
     /// when either changes the encode setup (a codec switch, or a ceiling
     /// that alters the encode dimensions — issue #41).
-    func negotiate(codec newCodec: StreamCodec, clientLimit: (width: Int, height: Int)?) {
+    func negotiate(
+        codec newCodec: StreamCodec,
+        clientLimit: (width: Int, height: Int)?,
+        clientLimit120: (width: Int, height: Int)? = nil
+    ) {
         let sizeBefore = encodeSize(for: codec)
         let codecChanged = newCodec != codec
         if codecChanged {
@@ -775,6 +801,7 @@ class ScreenCapture {
         }
         codec = newCodec
         clientDecodeLimit = clientLimit
+        clientDecodeLimit120 = clientLimit120
 
         guard encoder != nil else { return }  // not streaming yet; startStreaming will pick both up
 

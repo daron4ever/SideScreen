@@ -88,140 +88,142 @@ class VideoDecoder(
     }
 
     private fun setupDecoder() {
-        decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY).also { it.start() }
-        decoderHandler = Handler(decoderThread!!.looper)
-
-        // Find a decoder that supports our resolution (prefer HW, fallback to SW)
-        val decoderName = findBestDecoder(currentWidth, currentHeight)
-        diagLog("setupDecoder: ${currentWidth}x$currentHeight, decoder=$decoderName")
-
-        val codec =
-            if (decoderName != null) {
-                MediaCodec.createByCodecName(decoderName)
-            } else {
-                MediaCodec.createDecoderByType(mime)
-            }
-
-        val callback =
-            object : MediaCodec.Callback() {
-                override fun onInputBufferAvailable(
-                    codec: MediaCodec,
-                    index: Int,
-                ) {
-                    availableInputBuffers.offer(index)
-                }
-
-                override fun onOutputBufferAvailable(
-                    codec: MediaCodec,
-                    index: Int,
-                    info: MediaCodec.BufferInfo,
-                ) {
-                    handleOutputBuffer(codec, index, info)
-                }
-
-                override fun onError(
-                    codec: MediaCodec,
-                    e: MediaCodec.CodecException,
-                ) {
-                    diagLog("Codec error: ${e.diagnosticInfo}")
-                    Log.e(TAG, "Codec error: ${e.diagnosticInfo}", e)
-                    needsKeyframe = true
-                    requestKeyframe("codec error", force = true)
-                }
-
-                override fun onOutputFormatChanged(
-                    codec: MediaCodec,
-                    format: MediaFormat,
-                ) {
-                    diagLog("Output format changed: $format")
-                }
-            }
-        codec.setCallback(callback, decoderHandler)
-
-        val format =
-            MediaFormat.createVideoFormat(
-                mime,
-                currentWidth,
-                currentHeight,
-            )
-
-        var configured = false
-
-        // Attempt 1: Full low-latency config
         try {
-            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-            format.setInteger(MediaFormat.KEY_PRIORITY, 0)
-            format.setInteger(MediaFormat.KEY_OPERATING_RATE, displayRefreshRate.toInt())
-            format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-            codec.configure(format, surface, null, 0)
-            configured = true
-            diagLog("Configured with full low-latency")
-        } catch (e: Exception) {
-            diagLog("Full low-latency config failed: ${e.message}")
-            codec.reset()
-            codec.setCallback(callback, decoderHandler)
-        }
+            decoderThread = HandlerThread("DecoderThread", Process.THREAD_PRIORITY_DISPLAY)
+            decoderThread!!.start()
+            decoderHandler = Handler(decoderThread!!.looper)
 
-        // Attempt 2: Without KEY_LOW_LATENCY
-        if (!configured) {
+            // Use the hardware codec whose limits were advertised, independent of the display's
+            // current mode. A legacy resolution/rate search is allowed only without that selection.
+            val codec =
+                CodecCapabilities.createDecoder(
+                    mime,
+                    { findLegacyDecoder(currentWidth, currentHeight) },
+                    MediaCodec::createByCodecName,
+                    MediaCodec::createDecoderByType,
+                )
+            decoder = codec
+            diagLog("setupDecoder: ${currentWidth}x$currentHeight, decoder=${codec.name}")
+
+            val callback =
+                object : MediaCodec.Callback() {
+                    override fun onInputBufferAvailable(
+                        codec: MediaCodec,
+                        index: Int,
+                    ) {
+                        availableInputBuffers.offer(index)
+                    }
+
+                    override fun onOutputBufferAvailable(
+                        codec: MediaCodec,
+                        index: Int,
+                        info: MediaCodec.BufferInfo,
+                    ) {
+                        handleOutputBuffer(codec, index, info)
+                    }
+
+                    override fun onError(
+                        codec: MediaCodec,
+                        e: MediaCodec.CodecException,
+                    ) {
+                        diagLog("Codec error: ${e.diagnosticInfo}")
+                        Log.e(TAG, "Codec error: ${e.diagnosticInfo}", e)
+                        needsKeyframe = true
+                        requestKeyframe("codec error", force = true)
+                    }
+
+                    override fun onOutputFormatChanged(
+                        codec: MediaCodec,
+                        format: MediaFormat,
+                    ) {
+                        diagLog("Output format changed: $format")
+                    }
+                }
+            codec.setCallback(callback, decoderHandler)
+
+            val format =
+                MediaFormat.createVideoFormat(
+                    mime,
+                    currentWidth,
+                    currentHeight,
+                )
+
+            var configured = false
+
+            // Attempt 1: Full low-latency config
             try {
-                val basicFormat =
-                    MediaFormat.createVideoFormat(
-                        mime,
-                        currentWidth,
-                        currentHeight,
-                    )
-                basicFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
-                basicFormat.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-                codec.configure(basicFormat, surface, null, 0)
+                format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                format.setInteger(MediaFormat.KEY_PRIORITY, 0)
+                format.setInteger(MediaFormat.KEY_OPERATING_RATE, displayRefreshRate.toInt())
+                format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                codec.configure(format, surface, null, 0)
                 configured = true
-                diagLog("Configured with basic format")
+                diagLog("Configured with full low-latency")
             } catch (e: Exception) {
-                diagLog("Basic config failed: ${e.message}")
+                diagLog("Full low-latency config failed: ${e.message}")
                 codec.reset()
                 codec.setCallback(callback, decoderHandler)
             }
-        }
 
-        // Attempt 3: Minimal config (just resolution)
-        if (!configured) {
-            try {
-                val minimalFormat =
-                    MediaFormat.createVideoFormat(
-                        mime,
-                        currentWidth,
-                        currentHeight,
-                    )
-                codec.configure(minimalFormat, surface, null, 0)
-                diagLog("Configured with minimal format")
-            } catch (e: Exception) {
-                diagLog("All configure attempts failed: ${e.message}")
-                Log.e(TAG, "All configure attempts failed", e)
-                codec.release()
-                decoderThread?.quitSafely()
-                decoderThread = null
-                decoderHandler = null
-                throw e
+            // Attempt 2: Without KEY_LOW_LATENCY
+            if (!configured) {
+                try {
+                    val basicFormat =
+                        MediaFormat.createVideoFormat(
+                            mime,
+                            currentWidth,
+                            currentHeight,
+                        )
+                    basicFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
+                    basicFormat.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                    codec.configure(basicFormat, surface, null, 0)
+                    configured = true
+                    diagLog("Configured with basic format")
+                } catch (e: Exception) {
+                    diagLog("Basic config failed: ${e.message}")
+                    codec.reset()
+                    codec.setCallback(callback, decoderHandler)
+                }
             }
-        }
 
-        codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
-        needsKeyframe = true
-        isRunning = true
-        codec.start()
-        decoder = codec
-        diagLog(
-            "Decoder started: ${currentWidth}x$currentHeight @ ${displayRefreshRate}Hz, " +
-                "surface=$surface, valid=${surface.isValid}",
-        )
+            // Attempt 3: Minimal config (just resolution)
+            if (!configured) {
+                try {
+                    val minimalFormat =
+                        MediaFormat.createVideoFormat(
+                            mime,
+                            currentWidth,
+                            currentHeight,
+                        )
+                    codec.configure(minimalFormat, surface, null, 0)
+                    diagLog("Configured with minimal format")
+                } catch (e: Exception) {
+                    diagLog("All configure attempts failed: ${e.message}")
+                    Log.e(TAG, "All configure attempts failed", e)
+                    throw e
+                }
+            }
+
+            codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
+            needsKeyframe = true
+            codec.start()
+            isRunning = true
+            diagLog(
+                "Decoder started: ${currentWidth}x$currentHeight @ ${displayRefreshRate}Hz, " +
+                    "surface=$surface, valid=${surface.isValid}",
+            )
+        } catch (e: Exception) {
+            release()
+            throw e
+        }
     }
 
     /**
-     * Find the best decoder for [mime] at the given resolution.
+     * Legacy search when no hardware codec could be selected for advertised limits.
      * Prefers hardware decoders, falls back to software if HW can't handle the resolution.
      * Returns codec name to use with MediaCodec.createByCodecName(), or null for default.
      */
-    private fun findBestDecoder(
+    private fun findLegacyDecoder(
         width: Int,
         height: Int,
     ): String? {
@@ -235,17 +237,17 @@ class VideoDecoder(
 
             for (info in codecList.codecInfos) {
                 if (info.isEncoder) continue
+                if (CodecCapabilities.isBrokenHevcDecoder(info.name, mime)) continue
                 val caps =
                     try {
                         info.getCapabilitiesForType(mime)
                     } catch (_: Exception) {
                         continue
                     }
+                if (!supportsRegularPlayback(caps::isFeatureRequired)) continue
 
                 val videoCaps = caps.videoCapabilities ?: continue
-                val isHardware =
-                    !info.name.startsWith("c2.android.") &&
-                        !info.name.startsWith("OMX.google.")
+                val isHardware = !CodecCapabilities.isSoftwareDecoder(info.name)
                 val supported = videoCaps.isSizeSupported(width, height)
                 val rateSupported =
                     supported &&
@@ -528,16 +530,24 @@ class VideoDecoder(
 
     fun release() {
         isRunning = false
+        val codec = decoder
+        val thread = decoderThread
+        decoder = null
+        decoderThread = null
+        decoderHandler = null
         try {
-            availableInputBuffers.clear()
-            decoder?.stop()
-            decoder?.release()
-            decoder = null
-            decoderThread?.quitSafely()
-            decoderThread = null
-            decoderHandler = null
+            codec?.stop()
         } catch (_: Exception) {
         }
+        try {
+            codec?.release()
+        } catch (_: Exception) {
+        }
+        try {
+            thread?.quitSafely()
+        } catch (_: Exception) {
+        }
+        availableInputBuffers.clear()
     }
 
     companion object {

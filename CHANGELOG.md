@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional `SIDESCREEN_SIGNING_IDENTITY` for certificate-backed local Mac builds;
   reject an invalid selection before stopping the app or cleaning build outputs.
 - Optional **Keep tablet charging from Mac** recovery in USB mode. The Mac host binds the tablet selected when enabled, corrects outgoing USB power once per attachment, and verifies incoming power. Recovery stays active when streaming stops, but requires the Mac app to remain open. Unsafe or unsupported states are reported without repeated power-switch attempts.
+- Stream-scoped tablet refresh requests and optional native-resolution decoder negotiation checked at 120 FPS, using the same eligible ordinary hardware decoder profile for capability limits and playback. Add numeric capture/encoder stage counters and retain six capture buffers above 60 Hz after the measured comparison; sustained 120 FPS depends on hardware and workload.
 
 ### Planned
 - mDNS auto-discovery for wireless mode
