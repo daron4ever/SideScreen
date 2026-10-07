@@ -2,7 +2,7 @@ import Foundation
 import Darwin
 
 struct USBChargingCommandResult: Sendable {
-    enum Failure: Sendable { case launch, timeout, cancelled, outputLimit }
+    enum Failure: Sendable { case launch, timeout, cancelled, outputLimit, invalidOutput }
     var status: Int32
     var output: String
     var failure: Failure?
@@ -45,7 +45,8 @@ struct USBChargingProcessRunner: USBChargingCommandRunning {
         private let timeout: TimeInterval
         private let limit: Int
         private var failure: USBChargingCommandResult.Failure?
-        private var output = Data()
+        private var standardOutput = Data()
+        private var standardError = Data()
         private var finished = false
         private var launched = false
 
@@ -88,10 +89,11 @@ struct USBChargingProcessRunner: USBChargingCommandRunning {
             try? stdout.fileHandleForWriting.close()
             try? stderr.fileHandleForWriting.close()
             let readers = DispatchGroup()
-            for pipe in [stdout, stderr] {
+            for (pipe, isStandardOutput) in [(stdout, true), (stderr, false)] {
                 readers.enter()
                 DispatchQueue.global(qos: .utility).async {
-                    self.drain(pipe.fileHandleForReading.fileDescriptor)
+                    self.drain(pipe.fileHandleForReading.fileDescriptor,
+                               isStandardOutput: isStandardOutput)
                     readers.leave()
                 }
             }
@@ -123,14 +125,24 @@ struct USBChargingProcessRunner: USBChargingCommandRunning {
             readers.wait()
             closePipes()
             lock.lock()
+            let output: String
+            // Decode each completed pipe independently: read boundaries can split
+            // a scalar, and bytes from the other pipe cannot complete that scalar.
+            if let decodedOutput = String(bytes: standardOutput, encoding: .utf8),
+               let decodedError = String(bytes: standardError, encoding: .utf8) {
+                output = decodedOutput + decodedError
+            } else {
+                output = ""
+                if failure == nil { failure = .invalidOutput }
+            }
             let result = USBChargingCommandResult(
                 status: process.isRunning ? -1 : process.terminationStatus,
-                output: String(decoding: output, as: UTF8.self), failure: failure)
+                output: output, failure: failure)
             lock.unlock()
             return result
         }
 
-        private func drain(_ descriptor: Int32) {
+        private func drain(_ descriptor: Int32, isStandardOutput: Bool) {
             let flags = fcntl(descriptor, F_GETFL)
             _ = fcntl(descriptor, F_SETFL, flags | O_NONBLOCK)
             var bytes = [UInt8](repeating: 0, count: 4096)
@@ -138,13 +150,18 @@ struct USBChargingProcessRunner: USBChargingCommandRunning {
                 let count = Darwin.read(descriptor, &bytes, bytes.count)
                 if count > 0 {
                     lock.lock()
-                    let remaining = max(0, limit - output.count)
-                    output.append(contentsOf: bytes.prefix(min(count, remaining)))
+                    let remaining = max(0, limit - standardOutput.count - standardError.count)
+                    let retainedBytes = bytes.prefix(min(count, remaining))
+                    if isStandardOutput {
+                        standardOutput.append(contentsOf: retainedBytes)
+                    } else {
+                        standardError.append(contentsOf: retainedBytes)
+                    }
                     if count > remaining && failure == nil {
                         failure = .outputLimit
                         if process.isRunning { process.terminate() }
                     }
-                    let stopReading = finished && output.count >= limit
+                    let stopReading = finished && standardOutput.count + standardError.count >= limit
                     lock.unlock()
                     if stopReading { return }
                     continue
@@ -582,8 +599,9 @@ final class USBChargingRecovery {
             var verified = false
             for index in 0..<5 {
                 if index > 0 {
-                    do { try await Task.sleep(nanoseconds: settleDelay) }
-                    catch { return false }
+                    do {
+                        try await Task.sleep(nanoseconds: settleDelay)
+                    } catch { return false }
                 }
                 guard await stillAttached(device, ticket: ticket) else { return false }
                 guard let updated = await readPort(device, ticket: ticket), updated.id == port.id
@@ -629,8 +647,9 @@ final class USBChargingRecovery {
         }
         for index in 0..<3 {
             if index > 0 {
-                do { try await Task.sleep(nanoseconds: bridgeRetryDelay) }
-                catch { return false }
+                do {
+                    try await Task.sleep(nanoseconds: bridgeRetryDelay)
+                } catch { return false }
             }
             guard bridgeAllowed(port) else { return false }
             if let device {
