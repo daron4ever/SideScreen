@@ -190,6 +190,12 @@ In Settings → Startup, turn on **Launch at Login** and **Auto-start streaming 
 
 First-time setup still needs a screen once to grant Screen Recording permission; after that the Mac runs fully headless. For wireless headless use, give the Mac a static IP or DHCP reservation, and consider enabling macOS Screen Sharing as a fallback way in.
 
+### Screen sleep
+
+SideScreen lets the Mac follow its configured display timeout. With both apps updated, the tablet stays awake while the Mac display is active. When the Mac display sleeps, the tablet allows its own configured screen timeout; the screens do not necessarily turn off at exactly the same instant. A disconnected or unresponsive host also releases the tablet's keep-awake request.
+
+Wake the Mac normally to resume capture. You may need to wake and unlock the tablet with its power button. If the connection survived, the tablet restores its video surface; if it was lost, use Connect or Reconnect. Screen timeout, device locking, and full system sleep remain controlled by the operating systems. An older Mac cannot signal its display-sleep state to the tablet.
+
 ---
 
 ## Configuration

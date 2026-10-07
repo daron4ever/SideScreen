@@ -31,6 +31,7 @@ private enum WireMessage {
     static let desktopGeometry: UInt8 = 13
     /// Client→server: same four-byte payload as type 11, checked at 120 FPS.
     static let clientDecoderLimits120: UInt8 = 14
+    static let clientSupportsHostDisplayState = HostDisplayStateMessage.capability
 }
 
 private extension NWEndpoint {
@@ -234,9 +235,23 @@ class StreamingServer {
     private var desktopWidth = 0
     private var desktopHeight = 0
     private var inputBuffer = Data()
+    private var hostDisplayState: HostDisplayStateMessage
 
-    init(port: UInt16) {
+    init(port: UInt16, hostDisplayAwake: Bool = true) {
         self.port = port
+        self.hostDisplayState = HostDisplayStateMessage(awake: hostDisplayAwake)
+    }
+
+    func setHostDisplayAwake(_ awake: Bool) {
+        networkQueue.async { [weak self] in
+            guard let self else { return }
+            self.sendHostDisplayState(self.hostDisplayState.setAwake(awake))
+        }
+    }
+
+    private func sendHostDisplayState(_ packet: Data?) {
+        guard let packet, let connection, connectionReady, !isStopped else { return }
+        connection.send(content: packet, completion: .contentProcessed { _ in })
     }
 
     var boundPort: UInt16? {
@@ -334,6 +349,7 @@ class StreamingServer {
         }
 
         connectionReady = false
+        hostDisplayState.resetConnection()
         clientSupportsFrameMetadata = false
         clientIsAvcOnly = false
         clientDecodeLimits = nil
@@ -411,6 +427,7 @@ class StreamingServer {
         debugLog("Client connected - sending display config first")
         sendDisplaySize()
         connectionReady = true
+        sendHostDisplayState(hostDisplayState.protocolStarted())
         debugLog("Connection ready for frames (metadata=\(clientSupportsFrameMetadata ? "on" : "off"), codec=\(codec))")
         onClientConnected?()
     }
@@ -663,6 +680,7 @@ class StreamingServer {
     }
 
     private func processInputBuffer(connection: NWConnection) {
+        guard self.connection === connection, !isStopped else { return }
         while let msgType = inputBuffer.first {
             switch msgType {
             case WireMessage.touchEvent:
@@ -771,6 +789,10 @@ class StreamingServer {
                     // went out without geometry, so send it on its own.
                     if connectionReady { sendDesktopGeometry() }
                 }
+
+            case WireMessage.clientSupportsHostDisplayState:
+                consumeInputBytes(1)
+                sendHostDisplayState(hostDisplayState.advertiseSupport())
 
             default:
                 debugLog("Unknown client input type: \(msgType)")

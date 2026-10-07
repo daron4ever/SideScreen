@@ -64,6 +64,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     )
     private var statusRefreshTimer: Timer?
     @MainActor private var usbChargingIsAwake = true
+    @MainActor private var hostDisplaySleepState = HostDisplaySleepState(
+        displaysAwake: CGDisplayIsAsleep(CGMainDisplayID()) == 0
+    )
     @MainActor private lazy var usbChargingRecovery = USBChargingRecovery(
         adbPath: { StatusDetector.adbExecutablePath() },
         onStatus: { [weak self] status in
@@ -89,6 +92,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// item, auto-start racing a manual click) must not build a second virtual
     /// display / server. Main-actor confined.
     private var isStartingServer = false
+    private var serverGeneration: UInt64 = 0
     /// The effective refresh rate the running pipeline was built with — lets
     /// the refresh-rate observer skip restarts that would change nothing.
     private var lastAppliedRefreshRate: Int?
@@ -105,7 +109,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Setup settings observers
         setupSettingsObservers()
-        setupUSBChargingLifecycle()
+        setupHostPowerLifecycle()
 
         // Check permissions
         Task {
@@ -400,7 +404,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
     }
 
-    @objc private func toggleServerFromMenu() {
+    @MainActor @objc private func toggleServerFromMenu() {
         if settings.isRunning {
             stopServer()
         } else {
@@ -424,12 +428,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settingsWindow = SettingsWindowController(settings: settings)
 
         settings.onToggleServer = { [weak self] in
-            guard let self else { return }
-            if self.settings.isRunning {
-                self.stopServer()
-            } else {
-                Task { [weak self] in
-                    await self?.startServer()
+            Task { @MainActor in
+                guard let self else { return }
+                if self.settings.isRunning {
+                    self.stopServer()
+                } else {
+                    await self.startServer()
                 }
             }
         }
@@ -474,7 +478,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @MainActor
-    private func setupUSBChargingLifecycle() {
+    private func setupHostPowerLifecycle() {
         let center = NSWorkspace.shared.notificationCenter
         center.publisher(for: NSWorkspace.willSleepNotification)
             .receive(on: DispatchQueue.main)
@@ -482,6 +486,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     self.usbChargingIsAwake = false
+                    self.hostDisplaySleepState.systemAwake = false
+                    self.hostDisplaySleepState.displaysAwake = false
+                    self.applyHostDisplaySleepState()
                     self.usbChargingRecovery.invalidate()
                     self.refreshUSBChargingPolicy()
                 }
@@ -493,10 +500,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     self.usbChargingIsAwake = true
+                    self.hostDisplaySleepState.systemAwake = true
+                    self.hostDisplaySleepState.displaysAwake = self.hostDisplaySleepState.displaysAwake
+                        || CGDisplayIsAsleep(CGMainDisplayID()) == 0
+                    self.applyHostDisplaySleepState()
                     self.refreshUSBChargingPolicy()
                 }
             }
             .store(in: &cancellables)
+        for (notification, awake) in [
+            (NSWorkspace.screensDidSleepNotification, false),
+            (NSWorkspace.screensDidWakeNotification, true)
+        ] {
+            center.publisher(for: notification)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        self.hostDisplaySleepState.displaysAwake = awake
+                        self.applyHostDisplaySleepState()
+                    }
+                }
+                .store(in: &cancellables)
+        }
+    }
+
+    @MainActor
+    private func applyHostDisplaySleepState() {
+        let awake = hostDisplaySleepState.isAwake
+        streamingServer?.setHostDisplayAwake(awake)
+        screenCapture?.setHostDisplayAwake(awake)
     }
 
     @MainActor
@@ -545,20 +578,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @MainActor
     func startServer() async {
-        let canStart = await MainActor.run { () -> Bool in
-            guard !isStartingServer, !settings.isRunning else { return false }
-            isStartingServer = true
-            return true
-        }
-        guard canStart else {
+        guard !isStartingServer, !settings.isRunning else {
             debugLog("startServer() ignored — already starting or already running")
             return
         }
+        isStartingServer = true
+        serverGeneration &+= 1
+        let generation = serverGeneration
         defer {
-            Task { @MainActor [weak self] in self?.isStartingServer = false }
+            if serverGeneration == generation { isStartingServer = false }
         }
         await checkPermissions()
+        guard serverGeneration == generation else { return }
         debugLog("🚀 startServer() invoked. Check permission: \(settings.hasScreenRecordingPermission)")
         guard settings.hasScreenRecordingPermission else {
             debugLog("❌ startServer aborted: Missing Screen Recording permission")
@@ -585,9 +618,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // Not critical - continue anyway
             }
 
-            await MainActor.run {
-                settings.displayCreated = true
-            }
+            settings.displayCreated = true
 
             // Run ADB setup (USB only) and display init wait in parallel.
             // For wireless mode, skip ADB entirely — the auth handshake gates LAN connections instead.
@@ -599,6 +630,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 group.addTask { try? await Task.sleep(nanoseconds: 500_000_000) }
             }
+            guard serverGeneration == generation else { return }
 
             virtualDisplayManager?.restoreDisplayPosition()
 
@@ -618,36 +650,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     userInfo: [NSLocalizedDescriptionKey: "The virtual display was created without a display ID."]
                 )
             }
-            screenCapture = try await ScreenCapture()
+            let newCapture = try await ScreenCapture()
+            guard serverGeneration == generation else { return }
+            screenCapture = newCapture
             if let capture = screenCapture {
                 capture.onPermissionDenied = { [weak self, weak capture] in
                     Task { @MainActor in
-                        guard let self, let capture, self.screenCapture === capture else { return }
+                        guard let self, let capture, self.serverGeneration == generation,
+                              self.screenCapture === capture else { return }
                         self.settings.hasScreenRecordingPermission = false
                         self.stopServer()
                         self.showSettings()
                     }
                 }
             }
-            screenCapture?.onCaptureMethodChanged = { [weak self] method in
-                guard let self = self else { return }
-                debugLog("Capture method: \(method)")
+            newCapture.onCaptureMethodChanged = { [weak self, weak newCapture] method in
                 Task { @MainActor in
+                    guard let self, let newCapture, self.serverGeneration == generation,
+                          self.screenCapture === newCapture else { return }
+                    debugLog("Capture method: \(method)")
                     self.settings.captureMethod = method
                 }
             }
             lastAppliedRefreshRate = settings.effectiveRefreshRate
-            try await screenCapture?.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
+            try await newCapture.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
+            guard serverGeneration == generation else {
+                newCapture.stopStreaming()
+                return
+            }
 
             // Setup server
-            streamingServer = StreamingServer(port: settings.port)
+            screenCapture?.setHostDisplayAwake(hostDisplaySleepState.isAwake)
+            streamingServer = StreamingServer(
+                port: settings.port, hostDisplayAwake: hostDisplaySleepState.isAwake
+            )
             streamingServer?.touchEnabled = settings.touchEnabled
             if settings.connectionMode == .wireless {
                 streamingServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
                 configurePairingCode(on: streamingServer)
-                streamingServer?.onWirelessClientPaired = { [weak self] deviceName in
-                    guard let self = self else { return }
+                streamingServer?.onWirelessClientPaired = { [weak self, weak newCapture] deviceName in
                     Task { @MainActor in
+                        guard let self, let newCapture, self.serverGeneration == generation,
+                              self.screenCapture === newCapture else { return }
                         self.currentWirelessDevice = deviceName
                         self.settings.currentWirelessDevice = deviceName
                         self.pairedDeviceStore.upsert(name: deviceName, lastConnected: Date())
@@ -661,37 +705,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let initialEncode = ScreenCapture.physicalSize(for: displayID)
             streamingServer?.setDesktopSize(width: size.width, height: size.height)
             streamingServer?.setDisplaySize(width: initialEncode.width, height: initialEncode.height, rotation: settings.rotation, flipHorizontal: settings.flipHorizontal, flipVertical: settings.flipVertical)
-            streamingServer?.onClientConnected = { [weak self] in
-                guard let self = self else { return }
-                self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
+            streamingServer?.onClientConnected = { [weak self, weak newCapture] in
+                newCapture?.requestKeyframeOrReplayCachedFrame(force: true)
                 Task { @MainActor in
+                    guard let self, let newCapture, self.serverGeneration == generation,
+                          self.screenCapture === newCapture else { return }
                     self.settings.clientConnected = true
                 }
             }
             // Runs synchronously on the server's network queue BEFORE the
             // display config is sent, so the config below carries the right
             // dimensions for the negotiated codec.
-            streamingServer?.onCodecNegotiated = { [weak self] codec in
-                guard let self = self, let capture = self.screenCapture else { return }
-                capture.negotiate(
-                    codec: codec,
-                    clientLimit: self.streamingServer?.clientDecodeLimits,
-                    clientLimit120: self.streamingServer?.clientDecodeLimits120
-                )
-                let enc = capture.encodeSize(for: codec)
-                // Whatever the codec negotiation settled on, this is what the
-                // stream's SPS will carry, so it is what the client must size
-                // its decoder for.
-                self.streamingServer?.setDesktopSize(width: size.width, height: size.height)
-                self.streamingServer?.setDisplaySize(width: enc.width, height: enc.height, rotation: self.settings.rotation, flipHorizontal: self.settings.flipHorizontal, flipVertical: self.settings.flipVertical)
+            streamingServer?.onCodecNegotiated = { [weak self, weak newCapture] codec in
+                // Capture lifecycle state belongs to the main actor; protocol
+                // startup waits here so config still follows negotiation.
+                DispatchQueue.main.sync {
+                    MainActor.assumeIsolated {
+                        guard let self, let newCapture, self.serverGeneration == generation,
+                              self.screenCapture === newCapture else { return }
+                        newCapture.negotiate(
+                            codec: codec,
+                            clientLimit: self.streamingServer?.clientDecodeLimits,
+                            clientLimit120: self.streamingServer?.clientDecodeLimits120
+                        )
+                        let enc = newCapture.encodeSize(for: codec)
+                        self.streamingServer?.setDesktopSize(width: size.width, height: size.height)
+                        self.streamingServer?.setDisplaySize(width: enc.width, height: enc.height, rotation: self.settings.rotation, flipHorizontal: self.settings.flipHorizontal, flipVertical: self.settings.flipVertical)
+                    }
+                }
             }
-            streamingServer?.onKeyframeRequested = { [weak self] force in
-                self?.screenCapture?.requestKeyframeOrReplayCachedFrame(force: force)
+            streamingServer?.onKeyframeRequested = { [weak newCapture] force in
+                newCapture?.requestKeyframeOrReplayCachedFrame(force: force)
             }
 
-            streamingServer?.onClientDisconnected = { [weak self] in
-                guard let self = self else { return }
+            streamingServer?.onClientDisconnected = { [weak self, weak newCapture] in
                 Task { @MainActor in
+                    guard let self, let newCapture, self.serverGeneration == generation,
+                          self.screenCapture === newCapture else { return }
                     self.settings.clientConnected = false
                     // Final lastConnected snapshot at the disconnect moment, then
                     // freeze (currentWirelessDevice = nil stops the rolling update
@@ -704,15 +754,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            streamingServer?.onTouchEvent = { [weak self] x, y, action, pointerCount, x2, y2 in
-                self?.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2)
+            streamingServer?.onTouchEvent = { [weak self, weak newCapture] x, y, action, pointerCount, x2, y2 in
+                // StreamingServer already delivers touch on the main queue.
+                MainActor.assumeIsolated {
+                    guard let self, let newCapture, self.serverGeneration == generation,
+                          self.screenCapture === newCapture else { return }
+                    self.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2)
+                }
             }
 
-            streamingServer?.onStats = { [weak self] fps, mbps in
-                let captured = self
+            streamingServer?.onStats = { [weak self, weak newCapture] fps, mbps in
                 Task { @MainActor in
-                    captured?.settings.currentFPS = fps
-                    captured?.settings.currentBitrate = mbps
+                    guard let self, let newCapture, self.serverGeneration == generation,
+                          self.screenCapture === newCapture else { return }
+                    self.settings.currentFPS = fps
+                    self.settings.currentBitrate = mbps
                 }
             }
 
@@ -724,6 +780,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 )
             }
             try await server.start()
+            guard serverGeneration == generation else {
+                server.stop()
+                newCapture.stopStreaming()
+                return
+            }
             screenCapture?.startStreaming(
                 to: server,
                 bitrateMbps: settings.effectiveBitrate,
@@ -732,27 +793,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 frameRate: settings.effectiveRefreshRate
             )
 
-            await MainActor.run {
-                settings.isRunning = true
-            }
+            settings.isRunning = true
 
             print("✅ Server started on port \(settings.port)")
         } catch {
+            guard serverGeneration == generation else { return }
             print("❌ Failed to start: \(error)")
-            await MainActor.run {
-                self.tearDownServerResources(saveDisplayPosition: false)
+            self.tearDownServerResources(saveDisplayPosition: false)
 
-                if isScreenRecordingPermissionDenied(error) {
-                    self.settings.hasScreenRecordingPermission = false
-                    self.showSettings()
-                    return
-                }
-                let alert = NSAlert()
-                alert.messageText = "Failed to Start Server"
-                alert.informativeText = error.localizedDescription
-                alert.alertStyle = .critical
-                alert.runModal()
+            if isScreenRecordingPermissionDenied(error) {
+                self.settings.hasScreenRecordingPermission = false
+                self.showSettings()
+                return
             }
+            let alert = NSAlert()
+            alert.messageText = "Failed to Start Server"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .critical
+            alert.runModal()
         }
     }
 
@@ -788,7 +846,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @MainActor
     private func tearDownServerResources(saveDisplayPosition: Bool) {
+        serverGeneration &+= 1
+        isStartingServer = false
         if saveDisplayPosition {
             virtualDisplayManager?.saveDisplayPosition()
         }
@@ -812,6 +873,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.currentBitrate = 0
     }
 
+    @MainActor
     func stopServer() {
         tearDownServerResources(saveDisplayPosition: true)
 

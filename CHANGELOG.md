@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve decoder-supported native tablet resolutions to avoid unnecessary scaling and softened text; retain aligned fallback for unsupported sizes.
 - Refresh screen-recording permission on app activation and request consent only
   through an explicit user action; stop capture recovery on authorization denial.
+- **Automatic screen sleep while streaming.** The Mac now follows its configured display timeout. With both apps updated, the tablet stays awake while the Mac display is active and allows its own screen timeout when the Mac display sleeps or the host stops responding. Capture resumes after Mac wake; the tablet may still require normal wake/unlock and manual reconnection if the connection was lost.
 
 ### Added
 - Optional `SIDESCREEN_SIGNING_IDENTITY` for certificate-backed local Mac builds;
